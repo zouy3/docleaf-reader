@@ -38,7 +38,10 @@ if (-not (Has-Command "node")) {
 }
 
 Refresh-Path
-if (-not (Has-Command "cargo")) {
+$bridgeExe = Join-Path $PSScriptRoot "integrations\fqapp\docleaf_bridge.exe"
+$needsBuildTools = -not (Test-Path -LiteralPath $bridgeExe)
+
+if ($needsBuildTools -and (-not (Has-Command "cargo"))) {
     Install-WingetPackage "Rustlang.Rustup" "Rust"
     Refresh-Path
     if (Has-Command "rustup") {
@@ -54,7 +57,7 @@ if (Test-Path -LiteralPath $vswhere) {
     $hasCppTools = -not [string]::IsNullOrWhiteSpace(($installation | Out-String))
 }
 
-if (-not $hasCppTools) {
+if ($needsBuildTools -and (-not $hasCppTools)) {
     Install-WingetPackage `
         "Microsoft.VisualStudio.2022.BuildTools" `
         "Visual Studio C++ Build Tools" `

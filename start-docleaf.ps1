@@ -23,7 +23,10 @@ function Test-Url([string]$Url) {
 Write-Host "[DocLeaf] Checking runtime..." -ForegroundColor Cyan
 if (-not (Has-Command "node")) { Fail "Node.js was not found. Install Node.js 22 or newer: https://nodejs.org/" }
 if (-not (Has-Command "npm")) { Fail "npm was not found. Reinstall Node.js." }
-if (-not (Has-Command "cargo")) { Fail "Rust was not found. Install it from https://rustup.rs/" }
+$bridgeExe = Join-Path $PSScriptRoot "integrations\fqapp\docleaf_bridge.exe"
+if ((-not (Test-Path -LiteralPath $bridgeExe)) -and (-not (Has-Command "cargo"))) {
+    Fail "The prebuilt source service is missing and Rust was not found. Download the Windows package from GitHub Releases."
+}
 
 $nodeMajorText = (& node -p "Number(process.versions.node.split('.')[0])").Trim()
 if ($LASTEXITCODE -ne 0) { Fail "Unable to detect the Node.js version." }
@@ -39,8 +42,14 @@ if (-not (Test-Path -LiteralPath "node_modules")) {
 
 $projectDir = $PSScriptRoot
 if (-not (Test-Url "http://127.0.0.1:8787/health")) {
-    Write-Host "[DocLeaf] Starting the Fanqie source service. The first build can take several minutes..." -ForegroundColor Cyan
-    $bridgeCommand = 'cd /d "' + $projectDir + '" && cargo run --manifest-path integrations/fqapp/rust/Cargo.toml --bin docleaf_bridge'
+    if (Test-Path -LiteralPath $bridgeExe) {
+        Write-Host "[DocLeaf] Starting the prebuilt Fanqie source service..." -ForegroundColor Cyan
+        $bridgeCommand = 'cd /d "' + $projectDir + '" && "' + $bridgeExe + '"'
+    }
+    else {
+        Write-Host "[DocLeaf] Building and starting the Fanqie source service..." -ForegroundColor Cyan
+        $bridgeCommand = 'cd /d "' + $projectDir + '" && cargo run --manifest-path integrations/fqapp/rust/Cargo.toml --bin docleaf_bridge'
+    }
     Start-Process -FilePath "cmd.exe" -ArgumentList @("/k", $bridgeCommand) | Out-Null
 }
 else {

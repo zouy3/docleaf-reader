@@ -247,10 +247,18 @@ fn ensure_pool(example: &Path, pool: &Path) -> Result<(), String> {
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
-    let rust_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let fqapp_dir = rust_dir
-        .parent()
-        .ok_or_else(|| "invalid fqapp path".to_string())?;
+    let packaged_dir = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .filter(|path| path.join("assets/config/config.json").is_file());
+    let fqapp_dir = if let Some(path) = packaged_dir {
+        path
+    } else {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .ok_or_else(|| "invalid fqapp path".to_string())?
+            .to_path_buf()
+    };
     let assets = fqapp_dir.join("assets");
     let data = fqapp_dir.join(".docleaf-data");
     let pool = data.join("device_pool.json");

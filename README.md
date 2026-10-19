@@ -22,13 +22,18 @@ http://localhost:3000/
 
 ### macOS
 
-双击 `一键启动.command`。如果 macOS 阻止首次打开，请右键文件，选择“打开”。关闭启动器的终端窗口或按 `Control+C` 即可停止服务。
+在 [Releases](https://github.com/zouy3/docleaf-reader/releases/tag/desktop-latest) 下载与电脑对应的预编译包：
+
+- Apple M1/M2/M3/M4 等芯片：`DocLeaf-macOS-Apple-Silicon.zip`
+- Intel 芯片：`DocLeaf-macOS-Intel.zip`
+
+完整解压后双击 `一键启动.command`。预编译包不需要安装 Rust。如果 macOS 阻止首次打开，请右键该文件并选择“打开”；仍被拦截时，在项目目录运行 `xattr -dr com.apple.quarantine .` 后重试。关闭启动器终端或按 `Control+C` 即可停止服务。
 
 ### Windows 10/11
 
 #### 推荐：下载预编译版
 
-打开仓库右侧的 [Releases](https://github.com/zouy3/docleaf-reader/releases)，下载 **DocLeaf-Windows-x64.zip** 并完整解压。该版本已经包含番茄书源 `.exe`，不需要安装 Rust，也不需要安装约 1.7 GB 的 Visual Studio C++ Build Tools。
+打开 [桌面预编译版](https://github.com/zouy3/docleaf-reader/releases/tag/desktop-latest)，下载 **DocLeaf-Windows-x64.zip** 并完整解压。该版本已经包含番茄书源 `.exe`，不需要安装 Rust，也不需要安装约 1.7 GB 的 Visual Studio C++ Build Tools。
 
 在解压后的项目文件夹地址栏输入 `cmd` 并回车，然后运行：
 

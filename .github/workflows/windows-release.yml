@@ -1,4 +1,4 @@
-name: Build Windows package
+name: Build desktop packages
 
 on:
   workflow_dispatch:
@@ -11,30 +11,24 @@ on:
       - "start-docleaf.ps1"
       - "setup-and-start-docleaf.ps1"
       - "一键启动-Windows.bat"
+      - "一键启动.command"
 
 permissions:
   contents: write
 
 jobs:
-  windows-package:
+  windows:
     runs-on: windows-latest
     steps:
-      - name: Check out source
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
           workspaces: integrations/fqapp/rust
-
-      - name: Build precompiled source service
+      - name: Build source service
         shell: pwsh
         run: cargo build --release --manifest-path integrations/fqapp/rust/Cargo.toml --bin docleaf_bridge
-
-      - name: Assemble Windows package
+      - name: Assemble package
         shell: pwsh
         run: |
           git archive --format=zip --output docleaf-source.zip HEAD
@@ -42,17 +36,59 @@ jobs:
           Expand-Archive docleaf-source.zip package
           Copy-Item integrations/fqapp/rust/target/release/docleaf_bridge.exe package/integrations/fqapp/docleaf_bridge.exe
           Compress-Archive -Path package/* -DestinationPath DocLeaf-Windows-x64.zip -CompressionLevel Optimal
-
-      - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: DocLeaf-Windows-x64
+          name: windows-package
           path: DocLeaf-Windows-x64.zip
 
-      - name: Publish latest Windows release
-        shell: pwsh
+  mac:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-15
+            suffix: Apple-Silicon
+          - runner: macos-15-intel
+            suffix: Intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: integrations/fqapp/rust
+          key: ${{ matrix.suffix }}
+      - name: Build source service
+        run: cargo build --release --manifest-path integrations/fqapp/rust/Cargo.toml --bin docleaf_bridge
+      - name: Assemble package
+        run: |
+          mkdir -p package/DocLeaf
+          git archive HEAD | tar -x -C package/DocLeaf
+          cp integrations/fqapp/rust/target/release/docleaf_bridge package/DocLeaf/integrations/fqapp/docleaf_bridge
+          chmod +x package/DocLeaf/integrations/fqapp/docleaf_bridge package/DocLeaf/一键启动.command
+          ditto -c -k --sequesterRsrc --keepParent package/DocLeaf "DocLeaf-macOS-${{ matrix.suffix }}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.suffix }}
+          path: DocLeaf-macOS-${{ matrix.suffix }}.zip
+
+  release:
+    needs: [windows, mac]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "*-package"
+          path: release-assets
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "macos-*"
+          path: release-assets
+          merge-multiple: true
+      - name: Publish latest desktop release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release delete windows-latest --cleanup-tag --yes
-          gh release create windows-latest DocLeaf-Windows-x64.zip --target "${{ github.sha }}" --title "DocLeaf Windows 最新版" --notes "Windows x64 预编译版。解压后运行 一键启动-Windows.bat。已包含番茄书源可执行文件，无需安装 Rust 或 Visual Studio C++ Build Tools。" --latest
+          gh release delete desktop-latest --repo "${{ github.repository }}" --cleanup-tag --yes || true
+          gh release create desktop-latest release-assets/*.zip --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "DocLeaf 桌面预编译版" --notes "包含 Windows x64、macOS Apple Silicon 和 macOS Intel 三个预编译包。解压后运行对应的一键启动文件，无需安装 Rust 或 C++ Build Tools。" --latest
+

@@ -14,11 +14,6 @@
 
 ## 一键运行
 
-运行前需安装：
-
-- [Node.js](https://nodejs.org/) 22 或更高版本
-- [Rust](https://rustup.rs/)
-
 首次运行会自动执行 `npm install` 并编译本地书源，完成后自动打开：
 
 ```text
@@ -31,9 +26,78 @@ http://localhost:3000/
 
 ### Windows 10/11
 
-双击 `一键启动-Windows.bat`。脚本会分别打开“DocLeaf 番茄书源”和“DocLeaf 网页服务”两个命令窗口；关闭这两个窗口即可停止服务。
+#### 推荐：命令行一键安装并启动
 
-Windows 首次编译 Rust 时可能需要安装 Microsoft C++ Build Tools。如果 Cargo 提示缺少链接器，请安装 [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) 并勾选“使用 C++ 的桌面开发”。
+项目完整解压后，在项目文件夹的地址栏输入 `cmd` 并回车，然后运行：
+
+```bat
+一键启动-Windows.bat
+```
+
+脚本会通过 Windows 自带的 `winget` 自动安装缺少的 Node.js、Rust 和 Visual Studio C++ Build Tools，随后安装项目依赖并启动 DocLeaf。也可以直接双击这个 `.bat` 文件，效果相同。
+
+安装 C++ Build Tools 时 Windows 可能弹出管理员授权窗口，请选择“是”。首次安装和编译需要下载较多内容，耗时可能较长。如果提示找不到 `winget`，请先从 Microsoft Store 安装或更新 **应用安装程序（App Installer）**。
+
+下面是手动安装步骤，适合自动安装失败时排查。
+
+#### 第一步：下载完整项目
+
+在 GitHub 仓库页面点击 `Code` → `Download ZIP`，解压到普通文件夹。不要只单独下载 `一键启动-Windows.bat`，它还需要同目录下的源码和 `start-docleaf.ps1`。
+
+#### 第二步：安装 Node.js
+
+1. 打开 [Node.js 官网](https://nodejs.org/)，下载 Node.js 22 LTS 或更高版本的 Windows 安装包（`.msi`）。
+2. 运行安装程序，保持默认选项，并确保 Node.js 被添加到 `PATH`。
+3. 安装完成后关闭之前打开的命令行窗口，再打开新的“命令提示符”。
+4. 分别运行以下命令确认安装成功：
+
+```bat
+node -v
+npm -v
+```
+
+`node -v` 应显示 `v22` 或更高版本。如果仍显示“不是内部或外部命令”，请重启 Windows 后再试。
+
+#### 第三步：安装 Rust
+
+1. 打开 [Rust 安装页面](https://rustup.rs/)，下载并运行 `rustup-init.exe`。
+2. 在安装窗口输入 `1`，使用默认安装方式。
+3. 安装完成后关闭命令行窗口并重新打开，然后运行：
+
+```bat
+cargo -V
+```
+
+能够显示 Cargo 版本号即表示安装成功。
+
+#### 第四步：安装 C++ 编译工具（建议首次运行前安装）
+
+1. 下载并运行 [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)。
+2. 在“工作负载”中勾选 **使用 C++ 的桌面开发**。
+3. 保持右侧默认组件，确认其中包含 MSVC 编译工具和 Windows SDK，然后点击安装。
+4. 安装完成后建议重启 Windows。
+
+这是编译番茄书源所需的本地组件；如果缺少它，Cargo 通常会提示找不到 `link.exe` 或链接器。
+
+#### 第五步：启动 DocLeaf
+
+进入解压后的项目文件夹，双击 `一键启动-Windows.bat`，或在该文件夹的命令提示符中运行它。脚本将：
+
+1. 自动安装缺少的 Node.js、Rust 和 C++ 编译工具；
+2. 首次运行时自动下载网页依赖；
+3. 打开番茄书源和网页服务两个命令窗口；
+4. 服务就绪后自动打开 `http://localhost:3000/`。
+
+首次安装依赖和编译 Rust 可能需要几分钟，请保持窗口开启。以后启动会快很多。关闭两个 DocLeaf 命令窗口即可停止服务。
+
+#### Windows 常见问题
+
+- **`Node.js was not found`**：尚未安装 Node.js，或安装后的终端没有刷新。安装 Node.js 22+ 后关闭所有命令行窗口，必要时重启电脑。
+- **`Rust was not found`**：安装 Rust 后重新打开命令行，用 `cargo -V` 检查。
+- **找不到 `link.exe` / linker**：安装 Visual Studio Build Tools，并勾选“使用 C++ 的桌面开发”。
+- **端口被占用**：关闭旧的 DocLeaf、Node 或 Cargo 窗口后重新运行。
+- **浏览器没有自动打开**：手动访问 `http://localhost:3000/`。
+- **PowerShell 安全提示**：请从完整解压的项目中运行 `.bat`；启动器会仅为本次运行使用 `Bypass`，不会永久修改系统执行策略。
 
 ## 命令行运行
 

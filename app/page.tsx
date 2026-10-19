@@ -1,0 +1,1120 @@
+"use client";
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { CSSProperties, MouseEvent, SyntheticEvent } from "react";
+import { marked } from "marked";
+
+type Book = {
+  id: string;
+  name: string;
+  type: string;
+  size: number;
+  updatedAt: number;
+  content?: string;
+  buffer?: ArrayBuffer;
+  sourceBookId?: string;
+  author?: string;
+  chapters?: RemoteChapter[];
+  comments?: ReaderComment[];
+};
+
+type TocItem = { label: string; target: string; level: number };
+type OnlineBook = { id: string; title: string; author: string; description?: string };
+type RankTab = { name: string; algo: number };
+type RecommendedBook = OnlineBook & { cover?: string; category?: string; rank: number; readCount?: string };
+type ReaderComment = { id: string; author: string; content: string; likes?: number; images?: string[] };
+type RemoteChapter = { id: string; title: string; version?: string; content?: string; comments?: ReaderComment[]; paragraphComments?: Record<string, ReaderComment[]>; paragraphCommentCounts?: Record<string, number>; commentsVersion?: number; cachedAt?: number };
+
+const DB = "docleaf-library";
+const STORE = "books";
+const ACCEPT = ".txt,.md,.markdown,.html,.htm,.fb2,.rtf,.docx,.epub,.pdf";
+const SOURCE_API = "http://127.0.0.1:8787";
+
+function proxiedCommentImage(url: string) {
+  return `${SOURCE_API}/image?url=${encodeURIComponent(url)}`;
+}
+
+function retryOriginalCommentImage(image: HTMLImageElement) {
+  if (image.dataset.originalRetried === "true") return false;
+  try {
+    const current = new URL(image.src);
+    if (current.origin !== SOURCE_API || current.pathname !== "/image") return false;
+    const original = current.searchParams.get("url");
+    if (!original) return false;
+    image.dataset.originalRetried = "true";
+    image.referrerPolicy = "no-referrer";
+    image.src = original;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function findRankCard(value: any, depth = 0): any {
+  if (!value || depth > 12) return null;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findRankCard(item, depth + 1);
+      if (found) return found;
+    }
+    return null;
+  }
+  if (typeof value !== "object") return null;
+  if (value.rank_with_category_data) return value;
+  for (const item of Object.values(value)) {
+    const found = findRankCard(item, depth + 1);
+    if (found) return found;
+  }
+  return null;
+}
+
+function parseRankBooks(payload: any): RecommendedBook[] {
+  const cells = payload?.data?.cell_view?.cell_data;
+  if (!Array.isArray(cells)) return [];
+  const books: RecommendedBook[] = [];
+  const seen = new Set<string>();
+  const visit = (value: any) => {
+    if (!value || typeof value !== "object") return;
+    if (Array.isArray(value)) return value.forEach(visit);
+    const raw = Array.isArray(value.book_data) ? value.book_data[0] : value.book_data;
+    if (raw && typeof raw === "object") {
+      const id = String(raw.book_id || "");
+      if (id && !seen.has(id)) {
+        seen.add(id);
+        books.push({ id, title: String(raw.book_name || "未命名作品"), author: String(raw.author || "未知作者"), description: String(raw.abstract || raw.book_abstract_v2 || ""), cover: String(raw.thumb_url || raw.detail_page_thumb_url || ""), category: String(raw.category || "").split(/[,，]/)[0], rank: books.length + 1, readCount: String(raw.read_cnt_text || raw.rank_score || "") });
+      }
+    }
+    Object.values(value).forEach(visit);
+  };
+  cells.forEach(visit);
+  return books;
+}
+
+function openDb(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(STORE, { keyPath: "id" });
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function dbAll(): Promise<Book[]> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(STORE).objectStore(STORE).getAll();
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function dbGet(id: string): Promise<Book | undefined> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(STORE).objectStore(STORE).get(id);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function dbPut(book: Book) {
+  const db = await openDb();
+  return new Promise<void>((resolve, reject) => {
+    const req = db.transaction(STORE, "readwrite").objectStore(STORE).put(book);
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function dbDelete(id: string) {
+  const db = await openDb();
+  return new Promise<void>((resolve, reject) => {
+    const req = db.transaction(STORE, "readwrite").objectStore(STORE).delete(id);
+    req.onsuccess = () => resolve();
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function safeHtml(raw: string) {
+  const doc = new DOMParser().parseFromString(raw, "text/html");
+  doc.querySelectorAll("script,style,iframe,object,embed,form").forEach((node) => node.remove());
+  doc.querySelectorAll("*").forEach((node) => {
+    [...node.attributes].forEach((attr) => {
+      if (attr.name.startsWith("on") || ["src", "href"].includes(attr.name)) node.removeAttribute(attr.name);
+    });
+  });
+  return doc.body.innerHTML;
+}
+
+function textToHtml(text: string) {
+  const escaped = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return escaped
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => `<p>${line}</p>`)
+    .join("");
+}
+
+function formatSize(size: number) {
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function prepareContent(raw: string) {
+  const doc = new DOMParser().parseFromString(raw, "text/html");
+  const chapterPattern = /^(?:正文[\s　]*)?(?:第[\s　]*[零〇一二三四五六七八九十百千万两0-9０-９]+[\s　]*[章节卷回部篇集幕]|[上中下终]卷|序章|序言|楔子|引子|前言|后记|尾声|番外(?:篇)?)(?:[\s　]*[：:、.．-]?[\s　]*.*)?$/;
+  [...doc.body.querySelectorAll("p")].forEach((node) => {
+    if (!node.querySelector("br")) return;
+    const pieces = node.innerHTML.split(/<br\s*\/?\s*>/i).map((line) => line.trim()).filter(Boolean);
+    if (!pieces.some((line) => {
+      const probe = doc.createElement("div");
+      probe.innerHTML = line;
+      return chapterPattern.test(probe.textContent?.trim() || "");
+    })) return;
+    const fragment = doc.createDocumentFragment();
+    pieces.forEach((line) => {
+      const probe = doc.createElement("div");
+      probe.innerHTML = line;
+      const element = doc.createElement(chapterPattern.test(probe.textContent?.trim() || "") ? "h2" : "p");
+      element.innerHTML = line;
+      fragment.appendChild(element);
+    });
+    node.replaceWith(fragment);
+  });
+  let headings = [...doc.body.querySelectorAll("h1,h2,h3,h4")];
+  if (headings.length < 2) {
+    [...doc.body.querySelectorAll("p")].forEach((node) => {
+      const label = node.textContent?.trim() || "";
+      if (label.length <= 60 && chapterPattern.test(label)) {
+        const heading = doc.createElement("h2");
+        heading.innerHTML = node.innerHTML;
+        node.replaceWith(heading);
+      }
+    });
+    headings = [...doc.body.querySelectorAll("h1,h2,h3,h4")];
+  }
+  const toc = headings.map((node, index) => {
+    const id = `chapter-${index + 1}`;
+    node.id = id;
+    return { label: node.textContent?.trim() || `章节 ${index + 1}`, target: id, level: Number(node.tagName.slice(1)) };
+  });
+  [...doc.body.querySelectorAll("h1,h2,h3,h4,p,blockquote,li")].forEach((node, index) => {
+    node.setAttribute("data-reader-block", String(index));
+  });
+  return { html: doc.body.innerHTML, toc };
+}
+
+function normalizeComments(payload: any): ReaderComment[] {
+  const comments: ReaderComment[] = [];
+  const seen = new Set<string>();
+  const visit = (value: any) => {
+    if (!value || typeof value !== "object") return;
+    if (Array.isArray(value)) return value.forEach(visit);
+    const id = String(value.comment_id || value.commentId || value.id || "");
+    const content = value.common?.content?.text || value.content || value.comment_content || value.text || value.comment_text;
+    if (id && typeof content === "string" && content.trim() && content.length < 3000 && !seen.has(id)) {
+      seen.add(id);
+      comments.push({
+        id,
+        author: value.common?.user_info?.base_info?.user_name || value.user_info?.name || value.user?.name || value.user_name || value.nickname || "番茄读者",
+        content: content.replace(/<[^>]+>/g, "").trim(),
+        likes: Number(value.stat?.digg_count || value.digg_count || value.like_count || value.likes || 0),
+      });
+    }
+    Object.values(value).forEach(visit);
+  };
+  visit(payload?.data || payload);
+  return comments.slice(0, 50);
+}
+
+function normalizeParagraphCommentPage(payload: any): ReaderComment[] {
+  const code = Number(payload?.code ?? 0);
+  if (code !== 0 && code !== 200) return [];
+  const list = payload?.data?.data_list;
+  if (!Array.isArray(list)) return [];
+  return list.flatMap((entry: any) => {
+    const comment = entry?.comment;
+    if (!comment || typeof comment !== "object") return [];
+    const common = comment.common || {};
+    const content = common.content || {};
+    const rawImages = content?.image_data_list?.image_data;
+    const imageEntries = Array.isArray(rawImages) ? rawImages : (rawImages && typeof rawImages === "object" ? [rawImages] : []);
+    const images = [...new Set(imageEntries.flatMap((image: any) => {
+      const values = typeof image === "string"
+        ? [image]
+        : [image?.web_url, image?.expand_web_url, image?.url, image?.image_url, ...(Array.isArray(image?.url_list) ? image.url_list.map((item: any) => typeof item === "string" ? item : item?.url) : [])];
+      const url = values.map((value) => String(value || "").trim()).find((value) => /^https?:\/\/[^/]+/.test(value));
+      return url ? [url] : [];
+    }))];
+    const text = String(content.text || "").trim();
+    if (!text && !images.length) return [];
+    return [{
+      id: String(comment.comment_id || crypto.randomUUID()),
+      author: String(common?.user_info?.base_info?.user_name || "番茄读者"),
+      content: text,
+      likes: Number(comment?.stat?.digg_count || entry?.stat?.digg_count || 0),
+      images,
+    }];
+  });
+}
+
+function collectCommentIds(payload: any) {
+  const ids = new Set<string>();
+  const visit = (value: any, key = "") => {
+    if (value == null) return;
+    if (Array.isArray(value)) return value.forEach((item) => visit(item, key));
+    if (typeof value === "object") return Object.entries(value).forEach(([nextKey, item]) => visit(item, nextKey));
+    if (/comment.*id|insert.*id/i.test(key)) String(value).split(",").forEach((id) => /^\d+$/.test(id.trim()) && ids.add(id.trim()));
+  };
+  visit(payload);
+  return [...ids].slice(0, 50);
+}
+
+function collectParagraphCommentRefs(payload: any) {
+  const refs: Record<string, string[]> = {};
+  const direct: Record<string, ReaderComment[]> = {};
+  const counts: Record<string, number> = {};
+  const indexed = payload?.data?.data;
+  if (indexed && typeof indexed === "object" && !Array.isArray(indexed)) {
+    Object.entries(indexed).forEach(([index, value]: [string, any]) => {
+      if (!/^\d+$/.test(index) || !value || typeof value !== "object") return;
+      counts[index] = Number(value.count || 0);
+      refs[index] = collectCommentIds(value);
+      const comments = normalizeComments(value);
+      if (comments.length) direct[index] = comments;
+    });
+  }
+  const visit = (value: any) => {
+    if (!value || typeof value !== "object") return;
+    if (Array.isArray(value)) return value.forEach(visit);
+    const rawIndex = value.para_index ?? value.paragraph_index ?? value.paragraphIndex;
+    if (rawIndex !== undefined && /^\d+$/.test(String(rawIndex))) {
+      const key = String(rawIndex);
+      refs[key] = [...new Set([...(refs[key] || []), ...collectCommentIds(value)])];
+      counts[key] = Math.max(counts[key] || 0, Number(value.count || 0));
+      const comments = normalizeComments(value);
+      if (comments.length) direct[key] = comments;
+    }
+    Object.values(value).forEach(visit);
+  };
+  visit(payload?.data || payload);
+  return { refs, direct, counts };
+}
+
+function escapeText(value: string) {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function decorateRemoteContent(title: string, content: string, paragraphComments: Record<string, ReaderComment[]> = {}, paragraphCommentCounts: Record<string, number> = {}) {
+  const prepared = prepareContent(`<h2>${escapeText(title)}</h2>${content}`);
+  const doc = new DOMParser().parseFromString(prepared.html, "text/html");
+  const zeroBased = Object.prototype.hasOwnProperty.call(paragraphCommentCounts, "0") || Object.prototype.hasOwnProperty.call(paragraphComments, "0");
+  const paragraphs = [...doc.body.querySelectorAll("p")];
+  const hasSourceIndexes = paragraphs.some((paragraph) => paragraph.hasAttribute("idx"));
+  let fallbackIndex = 0;
+  paragraphs.forEach((paragraph) => {
+    if (hasSourceIndexes && !paragraph.hasAttribute("idx")) return;
+    const paraIndex = paragraph.getAttribute("idx") || String(zeroBased ? fallbackIndex : fallbackIndex + 1);
+    fallbackIndex++;
+    const comments = paragraphComments[paraIndex] || [];
+    const count = paragraphCommentCounts[paraIndex] || comments.length;
+    if (!count) return;
+    const button = doc.createElement("button");
+    button.type = "button";
+    button.className = "paragraph-comment-toggle";
+    button.setAttribute("data-paragraph-comments", paraIndex);
+    button.setAttribute("data-comment-count", String(count));
+    button.textContent = `评论 ${count}`;
+    const panel = doc.createElement("aside");
+    panel.className = "paragraph-comment-panel";
+    panel.setAttribute("data-loaded", comments.length ? "true" : "false");
+    panel.innerHTML = comments.map((comment) => `<article><b>${escapeText(comment.author)}</b>${comment.content ? `<p>${escapeText(comment.content)}</p>` : ""}${comment.images?.map((url) => `<img src="${escapeText(proxiedCommentImage(url))}" alt="评论图片" loading="lazy" referrerpolicy="no-referrer">`).join("") || ""}${comment.likes ? `<small>赞 ${comment.likes}</small>` : ""}</article>`).join("");
+    paragraph.insertAdjacentElement("afterend", panel);
+    paragraph.insertAdjacentElement("afterend", button);
+  });
+  return doc.body.innerHTML;
+}
+
+function flattenEpubToc(items: any[], level = 1): TocItem[] {
+  return items.flatMap((item) => [
+    { label: item.label?.trim() || "未命名章节", target: item.href, level },
+    ...flattenEpubToc(item.subitems || [], Math.min(level + 1, 4)),
+  ]);
+}
+
+export default function Home() {
+  const [books, setBooks] = useState<Book[]>([]);
+  const [active, setActive] = useState<Book | null>(null);
+  const [fontSize, setFontSize] = useState(18);
+  const [lineHeight, setLineHeight] = useState(1.85);
+  const [font, setFont] = useState("serif");
+  const [paperWidth, setPaperWidth] = useState(790);
+  const [sideOpen, setSideOpen] = useState(true);
+  const [zen, setZen] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const [toast, setToast] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [search, setSearch] = useState("");
+  const [pdfUrl, setPdfUrl] = useState<string | null>(null);
+  const [toc, setToc] = useState<TocItem[]>([]);
+  const [sideTab, setSideTab] = useState<"library" | "toc">("library");
+  const [progress, setProgress] = useState(0);
+  const [currentChapter, setCurrentChapter] = useState("");
+  const [sourceOpen, setSourceOpen] = useState(false);
+  const [sourceResults, setSourceResults] = useState<OnlineBook[]>([]);
+  const [sourceState, setSourceState] = useState("输入书名或作品 ID");
+  const [sourceBusy, setSourceBusy] = useState(false);
+  const [sourceProgress, setSourceProgress] = useState(0);
+  const [remoteChapterIndex, setRemoteChapterIndex] = useState(0);
+  const [remoteContent, setRemoteContent] = useState("");
+  const [remoteComments, setRemoteComments] = useState<ReaderComment[]>([]);
+  const [remoteLoading, setRemoteLoading] = useState(false);
+  const [cacheRunning, setCacheRunning] = useState(false);
+  const [cacheState, setCacheState] = useState("");
+  const [recommendOpen, setRecommendOpen] = useState(false);
+  const [recommendBusy, setRecommendBusy] = useState(false);
+  const [recommendError, setRecommendError] = useState("");
+  const [rankId, setRankId] = useState("");
+  const [rankTabs, setRankTabs] = useState<RankTab[]>([]);
+  const [rankAlgo, setRankAlgo] = useState(101);
+  const [recommendations, setRecommendations] = useState<RecommendedBook[]>([]);
+  const [selectedRecommendation, setSelectedRecommendation] = useState<RecommendedBook | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const canvasRef = useRef<HTMLElement>(null);
+  const epubRef = useRef<HTMLDivElement>(null);
+  const renditionRef = useRef<any>(null);
+  const epubBookRef = useRef<any>(null);
+  const tocRef = useRef<TocItem[]>([]);
+  const currentTocRef = useRef<HTMLButtonElement>(null);
+  const objectUrlRef = useRef<string | null>(null);
+  const sourceInputRef = useRef<HTMLInputElement>(null);
+  const cacheRunRef = useRef<string | null>(null);
+  const remoteLoadRef = useRef(0);
+
+  useEffect(() => {
+    dbAll().then((items) => {
+      const sorted = items.sort((a, b) => b.updatedAt - a.updatedAt);
+      setBooks(sorted);
+      const lastId = localStorage.getItem("docleaf-last-book");
+      const lastBook = sorted.find((book) => book.id === lastId);
+      if (lastBook) setActive(lastBook);
+    });
+    const prefs = localStorage.getItem("docleaf-prefs");
+    if (prefs) {
+      const p = JSON.parse(prefs);
+      setFontSize(p.fontSize || 18);
+      setLineHeight(p.lineHeight || 1.85);
+      setFont(p.font || "serif");
+      setPaperWidth(p.paperWidth || 790);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (active) localStorage.setItem("docleaf-last-book", active.id);
+  }, [active]);
+
+  useEffect(() => {
+    localStorage.setItem("docleaf-prefs", JSON.stringify({ fontSize, lineHeight, font, paperWidth }));
+  }, [fontSize, lineHeight, font, paperWidth]);
+
+  useEffect(() => {
+    if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
+    objectUrlRef.current = null;
+    setPdfUrl(null);
+    renditionRef.current?.destroy?.();
+    renditionRef.current = null;
+    epubBookRef.current?.destroy?.();
+    epubBookRef.current = null;
+    tocRef.current = [];
+    setToc([]);
+    setCurrentChapter("");
+    setProgress(Number(localStorage.getItem(`docleaf-progress:${active?.id}`) || 0));
+    if (active?.type === "fanqie" && active.chapters?.length) {
+      const items = active.chapters.map((chapter, index) => ({ label: chapter.title, target: `remote:${index}`, level: 2 }));
+      tocRef.current = items;
+      setToc(items);
+      const savedIndex = Math.max(0, Math.min(active.chapters.length - 1, Number(localStorage.getItem(`docleaf-chapter:${active.id}`) || 0)));
+      void loadRemoteChapter(active, savedIndex);
+      return;
+    }
+    if (!active?.buffer) return;
+    if (active.type === "pdf") {
+      objectUrlRef.current = URL.createObjectURL(new Blob([active.buffer], { type: "application/pdf" }));
+      setPdfUrl(objectUrlRef.current);
+    }
+    if (active.type === "epub" && epubRef.current) {
+      import("epubjs").then(({ default: ePub }) => {
+        if (!epubRef.current) return;
+        const book = ePub(active.buffer!);
+        epubBookRef.current = book;
+        const rendition = book.renderTo(epubRef.current, { width: "100%", height: "100%", spread: "none" });
+        renditionRef.current = rendition;
+        rendition.themes.default({ body: { padding: "28px 46px !important", color: "#292929", "font-family": font, "font-size": `${fontSize}px`, "line-height": String(lineHeight) } });
+        Promise.all([book.loaded.navigation, book.ready.then(() => book.locations.generate(900))]).then(([navigation]) => {
+          const items = flattenEpubToc(navigation.toc || []);
+          tocRef.current = items;
+          setToc(items);
+          rendition.display(localStorage.getItem(`docleaf-cfi:${active.id}`) || undefined);
+        });
+        rendition.on("relocated", (location: any) => {
+          const pct = Math.round((location.start.percentage || 0) * 100);
+          setProgress(pct);
+          localStorage.setItem(`docleaf-progress:${active.id}`, String(pct));
+          localStorage.setItem(`docleaf-cfi:${active.id}`, location.start.cfi);
+          const href = location.start.href?.split("#")[0];
+          const chapter = tocRef.current.find((item) => item.target.split("#")[0] === href);
+          if (chapter) setCurrentChapter(chapter.label);
+        });
+      });
+    }
+  }, [active]);
+
+  useEffect(() => {
+    renditionRef.current?.themes?.default({ body: { padding: "28px 46px !important", color: "#292929", "font-family": font, "font-size": `${fontSize}px`, "line-height": String(lineHeight) } });
+  }, [font, fontSize, lineHeight]);
+
+  const prepared = useMemo(() => active?.content ? prepareContent(active.content) : { html: "", toc: [] as TocItem[] }, [active]);
+
+  useEffect(() => {
+    if (!active?.content) return;
+    tocRef.current = prepared.toc;
+    setToc(prepared.toc);
+    const saved = Number(localStorage.getItem(`docleaf-progress:${active.id}`) || 0);
+    setProgress(saved);
+    window.setTimeout(() => restoreScrollAnchor(active.id, saved), 0);
+  }, [active, prepared]);
+
+  useEffect(() => {
+    if (!active || active.type === "epub" || active.type === "pdf") return;
+    const anchorId = active.type === "fanqie" ? `${active.id}:${remoteChapterIndex}` : active.id;
+    window.setTimeout(() => restoreScrollAnchor(anchorId, progress), 0);
+  }, [fontSize, lineHeight, paperWidth]);
+
+  useEffect(() => {
+    if (sideOpen && sideTab === "toc" && currentChapter) {
+      window.setTimeout(() => currentTocRef.current?.scrollIntoView({ behavior: "smooth", block: "center" }), 0);
+    }
+  }, [sideOpen, sideTab, currentChapter]);
+
+  function trackScroll() {
+    if (!active || active.type === "epub" || active.type === "pdf") return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const max = canvas.scrollHeight - canvas.clientHeight;
+    const within = max > 0 ? canvas.scrollTop / max : 0;
+    const pct = active.type === "fanqie" && active.chapters?.length
+      ? Math.round(((remoteChapterIndex + within) / active.chapters.length) * 100)
+      : Math.round(within * 100);
+    setProgress(pct);
+    localStorage.setItem(`docleaf-progress:${active.id}`, String(pct));
+    const blocks = [...canvas.querySelectorAll<HTMLElement>("[data-reader-block]")];
+    const anchor = blocks.filter((node) => node.getBoundingClientRect().top <= 240).at(-1) || blocks[0];
+    if (anchor) localStorage.setItem(`docleaf-anchor:${active.id}${active.type === "fanqie" ? `:${remoteChapterIndex}` : ""}`, JSON.stringify({ block: Number(anchor.dataset.readerBlock || 0), offset: 240 - anchor.getBoundingClientRect().top }));
+    const visible = prepared.toc.map((item) => document.getElementById(item.target)).filter(Boolean).reverse().find((node) => (node as HTMLElement).getBoundingClientRect().top < 240);
+    if (visible) setCurrentChapter(visible.textContent?.trim() || "");
+  }
+
+  function restoreScrollAnchor(bookId: string, fallbackProgress: number) {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    try {
+      const anchor = JSON.parse(localStorage.getItem(`docleaf-anchor:${bookId}`) || "null");
+      const block = canvas.querySelector<HTMLElement>(`[data-reader-block="${anchor?.block}"]`);
+      if (block) {
+        canvas.scrollTop += block.getBoundingClientRect().top - 240 + Number(anchor.offset || 0);
+        return;
+      }
+    } catch {}
+    canvas.scrollTop = (fallbackProgress / 100) * Math.max(0, canvas.scrollHeight - canvas.clientHeight);
+  }
+
+  function jumpProgress(value: number) {
+    if (!active) return;
+    if (active.type === "fanqie" && active.chapters?.length) {
+      const index = Math.min(active.chapters.length - 1, Math.floor((value / 100) * active.chapters.length));
+      void loadRemoteChapter(active, index);
+      return;
+    }
+    setProgress(value);
+    localStorage.setItem(`docleaf-progress:${active.id}`, String(value));
+    if (active.type === "epub" && epubBookRef.current?.locations) {
+      renditionRef.current?.display(epubBookRef.current.locations.cfiFromPercentage(value / 100));
+    } else if (active.type !== "pdf" && canvasRef.current) {
+      canvasRef.current.scrollTo({ top: (value / 100) * (canvasRef.current.scrollHeight - canvasRef.current.clientHeight), behavior: "smooth" });
+    }
+  }
+
+  function jumpToc(item: TocItem) {
+    if (active?.type === "fanqie" && item.target.startsWith("remote:")) void loadRemoteChapter(active, Number(item.target.slice(7)));
+    else if (active?.type === "epub") renditionRef.current?.display(item.target);
+    else document.getElementById(item.target)?.scrollIntoView({ behavior: "smooth", block: "start" });
+    setCurrentChapter(item.label);
+  }
+
+  async function toggleParagraphComments(event: MouseEvent<HTMLElement>) {
+    const button = (event.target as HTMLElement).closest<HTMLButtonElement>(".paragraph-comment-toggle");
+    if (!button) return;
+    const panel = button.nextElementSibling as HTMLElement | null;
+    const open = button.classList.toggle("open");
+    panel?.classList.toggle("open", open);
+    button.textContent = open ? "收起评论" : `评论 ${button.dataset.commentCount || 0}`;
+    if (!open || !panel || panel.dataset.loaded === "true" || !active?.sourceBookId) return;
+    const chapter = active.chapters?.[remoteChapterIndex];
+    const paragraphIndex = button.dataset.paragraphComments;
+    if (!chapter || paragraphIndex === undefined) return;
+    button.disabled = true;
+    button.textContent = "正在读取评论…";
+    try {
+      const result = await fetchOneParagraphComments(active.sourceBookId, chapter, paragraphIndex);
+      const comments = result.comments;
+      panel.replaceChildren();
+      if (comments.length) {
+        comments.forEach((comment) => {
+          const article = document.createElement("article");
+          const author = document.createElement("b");
+          const content = document.createElement("p");
+          author.textContent = comment.author;
+          content.textContent = comment.content;
+          article.append(author);
+          if (comment.content) article.append(content);
+          comment.images?.forEach((url) => {
+            const picture = document.createElement("img");
+            picture.src = proxiedCommentImage(url);
+            picture.alt = "评论图片";
+            picture.loading = "lazy";
+            picture.referrerPolicy = "no-referrer";
+            picture.addEventListener("error", () => {
+              if (retryOriginalCommentImage(picture)) return;
+              const fallback = document.createElement("span");
+              fallback.className = "comment-image-error";
+              fallback.textContent = "评论图片链接已失效，文字内容仍可正常阅读";
+              picture.replaceWith(fallback);
+            }, { once: true });
+            article.append(picture);
+          });
+          if (comment.likes) {
+            const likes = document.createElement("small");
+            likes.textContent = `赞 ${comment.likes}`;
+            article.append(likes);
+          }
+          panel.append(article);
+        });
+      } else {
+        const empty = document.createElement("p");
+        empty.className = "comment-empty";
+        empty.textContent = "番茄返回了评论数量，但本次未返回可展示的评论正文。";
+        panel.append(empty);
+      }
+      panel.dataset.loaded = "true";
+      try {
+        const latest = await dbGet(active.id);
+        if (latest?.chapters?.[remoteChapterIndex]) {
+          const chapters = [...latest.chapters];
+          chapters[remoteChapterIndex] = { ...chapters[remoteChapterIndex], version: result.version, paragraphComments: { ...(chapters[remoteChapterIndex].paragraphComments || {}), [paragraphIndex]: comments } };
+          await dbPut({ ...latest, chapters });
+        }
+      } catch (cacheError) {
+        // The online result is already visible. A quota/IndexedDB failure must not
+        // turn a successfully loaded comment panel into an error state.
+        console.warn("评论已显示，但本地缓存失败", cacheError);
+      }
+    } catch (error) {
+      panel.replaceChildren();
+      const failure = document.createElement("p");
+      failure.className = "comment-empty";
+      failure.textContent = `${error instanceof Error ? error.message : "评论读取失败"}，收起后可再次点击重试。`;
+      panel.append(failure);
+    } finally {
+      button.disabled = false;
+      button.textContent = "收起评论";
+    }
+  }
+
+  function handleCommentImageError(event: SyntheticEvent<HTMLElement>) {
+    const image = event.target as HTMLImageElement;
+    if (image.tagName !== "IMG" || !image.closest(".reader-comments,.paragraph-comment-panel")) return;
+    if (retryOriginalCommentImage(image)) return;
+    const fallback = document.createElement("span");
+    fallback.className = "comment-image-error";
+    fallback.textContent = "评论图片链接已失效，文字内容仍可正常阅读";
+    image.replaceWith(fallback);
+  }
+
+  const flash = (message: string) => {
+    setToast(message);
+    window.setTimeout(() => setToast(""), 2400);
+  };
+
+  async function parseFile(file: File): Promise<Book> {
+    const ext = file.name.split(".").pop()?.toLowerCase() || "txt";
+    const base: Book = { id: `${Date.now()}-${crypto.randomUUID()}`, name: file.name.replace(/\.[^.]+$/, ""), type: ext, size: file.size, updatedAt: Date.now() };
+    if (["pdf", "epub"].includes(ext)) return { ...base, buffer: await file.arrayBuffer() };
+    if (ext === "docx") {
+      const mammoth = await import("mammoth/mammoth.browser");
+      const result = await mammoth.convertToHtml({ arrayBuffer: await file.arrayBuffer() });
+      return { ...base, content: safeHtml(result.value) };
+    }
+    const text = await file.text();
+    if (["md", "markdown"].includes(ext)) return { ...base, content: safeHtml(await marked.parse(text)) };
+    if (["html", "htm"].includes(ext)) return { ...base, content: safeHtml(text) };
+    if (ext === "fb2") {
+      const xml = new DOMParser().parseFromString(text, "application/xml");
+      const body = xml.querySelector("body");
+      return { ...base, content: body ? safeHtml(body.innerHTML) : textToHtml(text) };
+    }
+    if (ext === "rtf") {
+      const plain = text.replace(/\\par[d]?/g, "\n").replace(/\\'[0-9a-f]{2}/gi, "").replace(/\\[a-z]+-?\d* ?/gi, "").replace(/[{}]/g, "");
+      return { ...base, content: textToHtml(plain) };
+    }
+    return { ...base, content: textToHtml(text) };
+  }
+
+  async function importFiles(files: FileList | File[]) {
+    const selected = Array.from(files);
+    if (!selected.length) return;
+    setLoading(true);
+    let imported = 0;
+    for (const file of selected) {
+      try {
+        const book = await parseFile(file);
+        await dbPut(book);
+        setBooks((old) => [book, ...old]);
+        setActive(book);
+        imported++;
+      } catch (error) {
+        console.error(error);
+        flash(`${file.name} 解析失败`);
+      }
+    }
+    setLoading(false);
+    if (imported) flash(`已导入 ${imported} 本书，仅保存在此设备`);
+  }
+
+  async function removeBook(book: Book) {
+    await dbDelete(book.id);
+    setBooks((old) => old.filter((b) => b.id !== book.id));
+    if (active?.id === book.id) setActive(null);
+    if (localStorage.getItem("docleaf-last-book") === book.id) localStorage.removeItem("docleaf-last-book");
+    flash("已从本地书架移除");
+  }
+
+  function normalizeOnlineResults(payload: any): OnlineBook[] {
+    const root = payload?.data || payload || {};
+    const tabs = root.search_tabs || [];
+    const target = tabs.find((tab: any) => Number(tab?.tab_type) === 3)
+      || tabs.find((tab: any) => tab?.title === "书籍")
+      || tabs.find((tab: any) => tab?.title === "综合");
+    return (target?.data || []).flatMap((item: any) => {
+      const book = item?.book_data?.[0];
+      if (!book?.book_id) return [];
+      return [{ id: String(book.book_id), title: book.book_name || "未命名作品", author: book.author || "未知作者", description: book.abstract || "" }];
+    });
+  }
+
+  async function openSource() {
+    setSourceOpen(true);
+    setSourceState("正在连接本地书源…");
+    try {
+      const response = await fetch(`${SOURCE_API}/health`);
+      if (!response.ok) throw new Error();
+      setSourceState("本地书源已连接，输入书名或作品 ID");
+    } catch {
+      setSourceState("书源服务未启动，请使用 npm run dev:full 启动");
+    }
+  }
+
+  async function searchSource() {
+    const query = sourceInputRef.current?.value.trim() || "";
+    if (!query || sourceBusy) return;
+    setSourceBusy(true);
+    setSourceResults([]);
+    setSourceState("正在搜索…");
+    try {
+      if (/^\d{15,20}$/.test(query)) {
+        const response = await fetch(`${SOURCE_API}/api/detail?source=${encodeURIComponent("番茄")}&book_id=${query}&tab=${encodeURIComponent("小说")}`);
+        const payload = await response.json();
+        if (!response.ok || (payload.code && payload.code !== 200)) throw new Error(payload.message || "查询失败");
+        const data = payload.data || {};
+        setSourceResults([{ id: query, title: data.book_name || `作品 ${query}`, author: data.author || "未知作者", description: data.abstract || "" }]);
+        setSourceState("");
+      } else {
+        const response = await fetch(`${SOURCE_API}/api/search?source=${encodeURIComponent("番茄")}&query=${encodeURIComponent(query)}&page=1&tab=${encodeURIComponent("小说")}`);
+        const payload = await response.json();
+        if (!response.ok || (payload.code && payload.code !== 200)) throw new Error(payload.message || "搜索失败");
+        const results = normalizeOnlineResults(payload);
+        setSourceResults(results);
+        setSourceState(results.length ? `找到 ${results.length} 本作品` : "没有找到相关作品");
+      }
+    } catch (error) {
+      setSourceState(error instanceof Error ? error.message : "无法连接本地书源");
+    } finally {
+      setSourceBusy(false);
+    }
+  }
+
+  async function fetchChapterComments(bookId: string, chapterId: string) {
+    try {
+      const first = await fetch(`${SOURCE_API}/api/v1/chapters/${chapterId}/reviews?book_id=${bookId}`);
+      const firstPayload = await first.json();
+      let comments = normalizeComments(firstPayload);
+      const paragraphData = collectParagraphCommentRefs(firstPayload);
+      const paragraphComments = { ...paragraphData.direct };
+      const ids = collectCommentIds(firstPayload);
+      if (ids.length) {
+        const second = await fetch(`${SOURCE_API}/api/v1/books/${bookId}/reviews?book_id=${bookId}&group_id=${chapterId}&insert_comment_ids=${ids.join(",")}`);
+        if (second.ok) {
+          comments = normalizeComments(await second.json()).filter((comment) => ids.includes(comment.id));
+          const byId = new Map(comments.map((comment) => [comment.id, comment]));
+          Object.entries(paragraphData.refs).forEach(([index, commentIds]) => {
+            const matched = commentIds.map((id) => byId.get(id)).filter(Boolean) as ReaderComment[];
+            if (matched.length) paragraphComments[index] = matched;
+          });
+        }
+      }
+      return { comments, paragraphComments, paragraphCommentCounts: paragraphData.counts };
+    } catch {
+      return { comments: [] as ReaderComment[], paragraphComments: {} as Record<string, ReaderComment[]>, paragraphCommentCounts: {} as Record<string, number> };
+    }
+  }
+
+  async function fetchOneParagraphComments(bookId: string, chapter: RemoteChapter, paragraphIndex: string) {
+    async function refreshVersion() {
+      const directoryResponse = await fetch(`${SOURCE_API}/api/v1/books/${bookId}/directory`);
+      const directoryPayload = await directoryResponse.json();
+      const fresh = (directoryPayload?.data?.item_data_list || [])
+        .find((item: any) => String(item.item_id || item.itemId || "") === chapter.id);
+      return String(fresh?.version || "");
+    }
+    const currentVersion = chapter.version?.trim() || "";
+    const freshVersion = await refreshVersion().catch(() => "");
+    const versions = [...new Set([freshVersion, currentVersion].filter(Boolean))];
+    if (!versions.length) throw new Error("章节版本暂时无法获取");
+    let lastMessage = "番茄暂未返回该段评论";
+    for (const version of versions) {
+      for (const channel of ["38", "39"]) {
+        const params = new URLSearchParams({
+          book_id: bookId,
+          group_id: chapter.id,
+          group_type: "15",
+          comment_source: "2",
+          comment_type: "1",
+          server_channel: channel,
+          para_index: paragraphIndex,
+          item_version: version,
+          count: "20",
+        });
+        try {
+          const response = await fetch(`${SOURCE_API}/api/v1/books/${bookId}/reviews?${params}`, { signal: AbortSignal.timeout(20000) });
+          const payload = await response.json();
+          if (!response.ok || (payload.code && payload.code !== 200)) {
+            lastMessage = payload.message || `段评接口错误 ${payload.code || response.status}`;
+            continue;
+          }
+          const comments = normalizeParagraphCommentPage(payload);
+          if (comments.length) return { comments, version };
+          lastMessage = "番茄返回了评论数量，但评论正文暂时为空";
+        } catch (error) {
+          lastMessage = error instanceof Error && error.name === "TimeoutError" ? "段评请求超时" : (error instanceof Error ? error.message : "段评读取失败");
+        }
+      }
+    }
+    throw new Error(lastMessage);
+  }
+
+  async function fetchAndStoreChapter(book: Book, index: number, refreshShelf = true) {
+    const latest = await dbGet(book.id) || book;
+    const chapter = latest.chapters?.[index];
+    if (!chapter) throw new Error("章节不存在");
+    if (chapter.content && chapter.commentsVersion === 2) return { book: latest, chapter };
+    let raw = chapter.content || "";
+    if (!raw) {
+      const response = await fetch(`${SOURCE_API}/api/content?source=${encodeURIComponent("番茄")}&book_id=${latest.sourceBookId}&item_id=${chapter.id}&tab=${encodeURIComponent("小说")}`);
+      const payload = await response.json();
+      if (!response.ok || (payload.code && payload.code !== 200)) throw new Error(`${chapter.title} 获取失败`);
+      raw = Array.isArray(payload?.data?.content) ? payload.data.content.join("\n") : String(payload?.data?.content || "");
+      if (!raw.trim()) throw new Error(`${chapter.title} 内容为空`);
+    }
+    const commentData = await fetchChapterComments(latest.sourceBookId || "", chapter.id);
+    const current = await dbGet(book.id) || latest;
+    const storedChapter = { ...(current.chapters?.[index] || chapter), content: safeHtml(raw), comments: commentData.comments, paragraphComments: commentData.paragraphComments, paragraphCommentCounts: commentData.paragraphCommentCounts, commentsVersion: 2, cachedAt: Date.now() };
+    const chapters = [...(current.chapters || [])];
+    chapters[index] = storedChapter;
+    const updated: Book = {
+      ...current,
+      chapters,
+      size: chapters.reduce((sum, item) => sum + (item.content ? new Blob([item.content]).size : 0), 0),
+      updatedAt: Date.now(),
+    };
+    await dbPut(updated);
+    if (refreshShelf) setBooks((old) => old.map((item) => item.id === updated.id ? updated : item));
+    return { book: updated, chapter: storedChapter };
+  }
+
+  async function loadRemoteChapter(book: Book, index: number) {
+    if (!book.chapters?.length) return;
+    const safeIndex = Math.max(0, Math.min(book.chapters.length - 1, index));
+    const request = ++remoteLoadRef.current;
+    setRemoteLoading(true);
+    setRemoteChapterIndex(safeIndex);
+    try {
+      const result = await fetchAndStoreChapter(book, safeIndex);
+      if (request !== remoteLoadRef.current) return;
+      setRemoteContent(decorateRemoteContent(result.chapter.title, result.chapter.content || "", result.chapter.paragraphComments, result.chapter.paragraphCommentCounts));
+      setRemoteComments(result.chapter.comments?.length ? result.chapter.comments : (result.book.comments || []));
+      setCurrentChapter(result.chapter.title);
+      const pct = Math.round(((safeIndex + 1) / (result.book.chapters?.length || 1)) * 100);
+      setProgress(pct);
+      localStorage.setItem(`docleaf-chapter:${book.id}`, String(safeIndex));
+      localStorage.setItem(`docleaf-progress:${book.id}`, String(pct));
+      window.setTimeout(() => restoreScrollAnchor(`${book.id}:${safeIndex}`, 0), 0);
+    } catch (error) {
+      if (request === remoteLoadRef.current) {
+        setRemoteContent(`<p class="reader-error">${error instanceof Error ? error.message : "章节加载失败"}，请确认书源服务已启动。</p>`);
+        setRemoteComments([]);
+      }
+    } finally {
+      if (request === remoteLoadRef.current) setRemoteLoading(false);
+    }
+  }
+
+  async function cacheOnlineBook(book: Book) {
+    if (cacheRunRef.current) return;
+    cacheRunRef.current = book.id;
+    setCacheRunning(true);
+    try {
+      let latest = await dbGet(book.id) || book;
+      const total = latest.chapters?.length || 0;
+      for (let index = 0; index < total; index++) {
+        if (cacheRunRef.current !== book.id) break;
+        if (latest.chapters?.[index]?.content) continue;
+        setCacheState(`正在缓存 ${index + 1}/${total} 章`);
+        const result = await fetchAndStoreChapter(latest, index, false);
+        latest = result.book;
+        if ((index + 1) % 10 === 0) setBooks((old) => old.map((item) => item.id === latest.id ? latest : item));
+        setSourceProgress(Math.round(((index + 1) / total) * 100));
+        await new Promise((resolve) => window.setTimeout(resolve, 180));
+      }
+      const cached = latest.chapters?.filter((chapter) => chapter.content).length || 0;
+      setBooks((old) => old.map((item) => item.id === latest.id ? latest : item));
+      setCacheState(cached === total ? `已离线缓存全部 ${total} 章` : `已缓存 ${cached}/${total} 章`);
+    } catch (error) {
+      const latest = await dbGet(book.id) || book;
+      const cached = latest.chapters?.filter((chapter) => chapter.content).length || 0;
+      setBooks((old) => old.map((item) => item.id === latest.id ? latest : item));
+      setCacheState(`缓存暂停在 ${cached}/${latest.chapters?.length || 0} 章，点击可继续`);
+    } finally {
+      cacheRunRef.current = null;
+      setCacheRunning(false);
+    }
+  }
+
+  async function importOnlineBook(online: OnlineBook) {
+    if (sourceBusy) return;
+    setSourceBusy(true);
+    setSourceProgress(0);
+    setSourceState("正在读取目录…");
+    try {
+      const directoryResponse = await fetch(`${SOURCE_API}/api/v1/books/${online.id}/directory`);
+      const directoryPayload = await directoryResponse.json();
+      if (!directoryResponse.ok || (directoryPayload.code && directoryPayload.code !== 200)) throw new Error(directoryPayload.message || "目录获取失败");
+      const chapters = (directoryPayload?.data?.item_data_list || [])
+        .map((item: any) => ({ id: String(item.item_id || item.itemId || ""), title: item.title || "未命名章节", version: String(item.version || "") }))
+        .filter((item: any) => item.id);
+      if (!chapters.length) throw new Error("没有获取到章节目录");
+      let comments: ReaderComment[] = [];
+      try {
+        const commentsResponse = await fetch(`${SOURCE_API}/api/v1/books/${online.id}/comments?count=20&offset=0`);
+        if (commentsResponse.ok) comments = normalizeComments(await commentsResponse.json());
+      } catch {}
+      const book: Book = { id: `fanqie-${online.id}`, name: online.title, author: online.author, type: "fanqie", size: 0, updatedAt: Date.now(), sourceBookId: online.id, chapters, comments };
+      await dbPut(book);
+      setBooks((old) => [book, ...old.filter((item) => item.id !== book.id)]);
+      setActive(book);
+      setSearch("");
+      setSideTab("library");
+      setSideOpen(true);
+      setSourceOpen(false);
+      setRecommendOpen(false);
+      setSourceState("输入书名或作品 ID");
+      flash(`已加入书架，共 ${chapters.length} 章，正在打开首章`);
+      void cacheOnlineBook(book);
+    } catch (error) {
+      setSourceState(error instanceof Error ? error.message : "导入失败");
+    } finally {
+      setSourceBusy(false);
+    }
+  }
+
+  async function loadRankBoard(nextRankId: string, algo: number) {
+    setRecommendBusy(true);
+    setRecommendError("");
+    try {
+      const response = await fetch(`${SOURCE_API}/api/v1/rank/${nextRankId}?algo_type=${algo}&rank_sub_info_id=0`);
+      const payload = await response.json();
+      if (!response.ok || (payload.code && payload.code !== 200)) throw new Error(payload.message || "排行榜读取失败");
+      const list = parseRankBooks(payload);
+      if (!list.length) throw new Error("该榜单暂时没有可展示的书籍");
+      setRecommendations(list);
+      setSelectedRecommendation(list[0]);
+      setRankAlgo(algo);
+    } catch (error) {
+      setRecommendations([]);
+      setSelectedRecommendation(null);
+      setRecommendError(error instanceof Error ? error.message : "排行榜读取失败");
+    } finally {
+      setRecommendBusy(false);
+    }
+  }
+
+  async function openRecommendations() {
+    setRecommendOpen(true);
+    if (rankId && recommendations.length) return;
+    setRecommendBusy(true);
+    setRecommendError("");
+    try {
+      const response = await fetch(`${SOURCE_API}/api/v1/recommend/homepage?tab_type=2&offset=0`);
+      const payload = await response.json();
+      if (!response.ok || (payload.code && payload.code !== 200)) throw new Error(payload.message || "番茄首页读取失败");
+      const card = findRankCard(payload);
+      const id = String(card?.cell_id_str || card?.cell_id || "");
+      const tabs = (card?.rank_with_category_data?.rank_algo_list || [])
+        .map((item: any) => ({ name: String(item.rank_name || ""), algo: Number(item.rank_algo) }))
+        .filter((item: RankTab) => item.name && Number.isFinite(item.algo) && !item.name.includes("剧"));
+      if (!id || !tabs.length) throw new Error("没有找到番茄小说榜单");
+      setRankId(id);
+      setRankTabs(tabs);
+      await loadRankBoard(id, tabs[0].algo);
+    } catch (error) {
+      setRecommendError(error instanceof Error ? error.message : "书籍推荐读取失败");
+      setRecommendBusy(false);
+    }
+  }
+
+  function previousChapter() {
+    if (active?.type === "fanqie") void loadRemoteChapter(active, remoteChapterIndex - 1);
+    else if (active?.type === "epub") renditionRef.current?.prev();
+  }
+
+  function nextChapter() {
+    if (active?.type === "fanqie") void loadRemoteChapter(active, remoteChapterIndex + 1);
+    else if (active?.type === "epub") renditionRef.current?.next();
+  }
+
+  const shownBooks = books.filter((book) => book.name.toLowerCase().includes(search.toLowerCase()));
+
+  return (
+    <main className={`app ${zen ? "zen" : ""}`} onDragOver={(e) => { e.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={(e) => { e.preventDefault(); setDragging(false); importFiles(e.dataTransfer.files); }}>
+      <input ref={fileRef} className="sr-only" type="file" accept={ACCEPT} multiple onChange={(e) => e.target.files && importFiles(e.target.files)} />
+      <header className="titlebar">
+        <div className="brand"><span className="brand-mark">D</span><strong>DocLeaf</strong><span className="saved">本地模式 · 已自动保存</span></div>
+        <div className="document-title">文档</div>
+        <div className="window-actions"><button aria-label="专注模式" onClick={() => setZen(!zen)}>▣</button><span>—</span><span>□</span><span>×</span></div>
+      </header>
+
+      <nav className="tabs" aria-label="功能区选项卡">
+        <button className="file-tab" onClick={() => fileRef.current?.click()}>文件</button>
+        <button className="active">开始</button><button>插入</button><button>布局</button><button>视图</button><button className="recommend-tab" onClick={openRecommendations}>书籍推荐</button>
+        <span className="privacy">文件不会离开你的浏览器</span>
+      </nav>
+
+      <section className="ribbon">
+        <div className="tool-group import-group">
+          <button className="big-tool" onClick={() => fileRef.current?.click()}><span className="tool-icon">＋</span><b>打开书籍</b></button>
+          <div className="mini-stack"><button onClick={() => { setSideOpen(true); setSideTab("library"); }}>☰ 书架</button><button onClick={openSource}>⌕ 番茄书源</button><button onClick={() => setActive(null)}>⌂ 主页</button></div>
+          <label>书籍</label>
+        </div>
+        <div className="tool-group">
+          <div className="control-row">
+            <select aria-label="字体" value={font} onChange={(e) => setFont(e.target.value)}><option value="serif">宋体</option><option value="sans-serif">黑体</option><option value="system-ui">系统字体</option></select>
+            <select aria-label="字号" value={fontSize} onChange={(e) => setFontSize(Number(e.target.value))}>{[14,16,18,20,22,24,28].map((n) => <option key={n}>{n}</option>)}</select>
+          </div>
+          <div className="format-buttons"><button onClick={() => setFontSize(Math.min(32, fontSize + 1))}>A↑</button><button onClick={() => setFontSize(Math.max(12, fontSize - 1))}>A↓</button><button className="bold">B</button><button className="italic">I</button><button className="underline">U</button><button>ab⌫</button></div>
+          <label>字体</label>
+        </div>
+        <div className="tool-group">
+          <div className="format-buttons wide"><button>☷</button><button>≡</button><button>☰</button><button>¶</button></div>
+          <div className="control-row"><span>行距</span><input aria-label="行距" type="range" min="1.3" max="2.5" step="0.05" value={lineHeight} onChange={(e) => setLineHeight(Number(e.target.value))} /></div>
+          <label>段落</label>
+        </div>
+        <div className="tool-group paper-tools">
+          <div className="paper-width-value"><span>▯</span><b>{paperWidth}px</b></div>
+          <div className="control-row"><span>窄</span><input aria-label="纸张宽度" type="range" min="520" max="1200" step="10" value={paperWidth} onChange={(e) => setPaperWidth(Number(e.target.value))}/><span>宽</span></div>
+          <label>纸张宽度</label>
+        </div>
+        <div className="tool-group view-tools">
+          <button onClick={() => { setSideOpen(true); setSideTab("toc"); }}><span>▤</span>目录</button>
+          <button onClick={() => setZen(!zen)}><span>◱</span>专注阅读</button>
+          <label>视图</label>
+        </div>
+        <div className="tool-group chapter-tools">
+          <button disabled={!active || !["fanqie", "epub"].includes(active.type) || (active.type === "fanqie" && (remoteChapterIndex <= 0 || remoteLoading))} onClick={previousChapter}><span>←</span>上一章</button>
+          <button disabled={!active || !["fanqie", "epub"].includes(active.type) || (active.type === "fanqie" && (remoteChapterIndex >= (active.chapters?.length || 1) - 1 || remoteLoading))} onClick={nextChapter}><span>→</span>下一章</button>
+          <label>章节</label>
+        </div>
+      </section>
+
+      <div className="workspace">
+        {sideOpen && <aside className="sidebar">
+          <div className="side-heading"><strong>导航</strong><button aria-label="关闭书架" onClick={() => setSideOpen(false)}>×</button></div>
+          <div className="side-tabs"><button className={sideTab === "library" ? "active" : ""} onClick={() => setSideTab("library")}>书架</button><button className={sideTab === "toc" ? "active" : ""} onClick={() => setSideTab("toc")} disabled={!active}>目录 {toc.length ? `(${toc.length})` : ""}</button></div>
+          {sideTab === "library" ? <><div className="search"><span>⌕</span><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="搜索本地书籍" /></div>
+          <button className="import-card" onClick={() => fileRef.current?.click()}><span>＋</span><div><b>导入书籍</b><small>EPUB、PDF、TXT、DOCX…</small></div></button>
+          <div className="book-list">
+            {shownBooks.map((book) => <button key={book.id} className={`book-item ${active?.id === book.id ? "selected" : ""}`} onClick={() => setActive(book)}>
+              <span className={`book-cover c-${book.name.charCodeAt(0) % 5}`}>{book.name.slice(0, 1)}</span>
+              <span className="book-meta"><b>{book.name}</b><small>{book.type === "fanqie" ? `番茄 · 已缓存 ${book.chapters?.filter((chapter) => chapter.content).length || 0}/${book.chapters?.length || 0} 章` : `${book.type.toUpperCase()} · ${formatSize(book.size)}`}</small></span>
+              <span className="delete" role="button" aria-label={`删除 ${book.name}`} onClick={(e) => { e.stopPropagation(); removeBook(book); }}>×</span>
+            </button>)}
+            {!shownBooks.length && books.length > 0 && <p className="empty-hint">没有匹配的书籍</p>}
+          </div></> : <div className="toc-list">{toc.length ? toc.map((item, index) => <button ref={currentChapter === item.label ? currentTocRef : undefined} key={`${item.target}-${index}`} className={currentChapter === item.label ? "current" : ""} style={{ paddingLeft: `${10 + (item.level - 1) * 12}px` }} onClick={() => jumpToc(item)}><span>{item.label}</span></button>) : <div className="toc-empty"><span>☷</span><b>未识别到目录</b><small>{active?.type === "pdf" ? "PDF 请使用阅读器自带的目录" : "带有章节标题的文件会自动生成目录"}</small></div>}</div>}
+          <div className="local-note"><span>⌾</span><p><b>完全离线</b><br/>所有书籍只存储在当前浏览器中</p></div>
+        </aside>}
+
+        <section className="canvas" ref={canvasRef} onScroll={trackScroll} style={{ "--paper-width": `${paperWidth}px` } as CSSProperties}>
+          {!active ? <div className="welcome-page">
+            <div className="welcome-symbol">D</div>
+            <p className="eyebrow">你的私人阅读空间</p>
+            <h1>像打开文档一样，<br/>安静地读一本书。</h1>
+            <p className="intro">无需注册，也不会上传。把书拖到这里，它只属于这台设备。</p>
+            <button className="primary" onClick={() => fileRef.current?.click()}>＋&nbsp; 选择本地书籍</button>
+            <div className="drop-tip"><span>⇩</span>也可以直接拖入文件</div>
+            <div className="formats"><span>EPUB</span><span>PDF</span><span>TXT</span><span>DOCX</span><span>MD</span><span>HTML</span><span>FB2</span><span>RTF</span></div>
+            <div className="feature-row"><div><b>私密</b><small>内容不经服务器</small></div><div><b>离线</b><small>断网也能阅读</small></div><div><b>专注</b><small>熟悉的文档外观</small></div></div>
+          </div> : active.type === "pdf" && pdfUrl ? <div className="special-reader" style={{ width: paperWidth, maxWidth: "100%" }}><iframe title={active.name} src={pdfUrl} /></div> : active.type === "epub" ? <div className="special-reader epub-shell" style={{ width: paperWidth, maxWidth: "100%" }}><div className="epub-view" ref={epubRef}/><div className="epub-controls"><button onClick={() => renditionRef.current?.prev()}>← 上一页</button><span>{progress}%</span><button onClick={() => renditionRef.current?.next()}>下一页 →</button></div></div> : active.type === "fanqie" && active.chapters?.length ? <article className="paper remote-paper" onClick={toggleParagraphComments} onError={handleCommentImageError} style={{ fontFamily: font, fontSize, lineHeight, width: paperWidth, maxWidth: "calc(100% - 30px)" }}>
+            <div className="remote-toolbar"><span>{active.author || "未知作者"} · {remoteChapterIndex + 1}/{active.chapters?.length || 0}</span><button disabled={cacheRunning} onClick={() => cacheOnlineBook(active)}>{cacheRunning ? cacheState || "正在缓存…" : (cacheState.includes("全部") ? cacheState : "缓存全书 / 继续缓存")}</button></div>
+            <div className="rule"/>
+            {remoteLoading ? <div className="chapter-loading">正在在线读取本章…</div> : <div dangerouslySetInnerHTML={{ __html: remoteContent }} />}
+            <nav className="chapter-nav"><button disabled={remoteChapterIndex <= 0 || remoteLoading} onClick={() => loadRemoteChapter(active, remoteChapterIndex - 1)}>← 上一章</button><button onClick={() => { setSideOpen(true); setSideTab("toc"); }}>目录</button><button disabled={remoteChapterIndex >= (active.chapters?.length || 1) - 1 || remoteLoading} onClick={() => loadRemoteChapter(active, remoteChapterIndex + 1)}>下一章 →</button></nav>
+            <section className="reader-comments"><h3>读者评论 <span>{remoteComments.length}</span></h3>{remoteComments.length ? remoteComments.map((comment) => <article key={comment.id}><b>{comment.author}</b>{comment.content && <p>{comment.content}</p>}{comment.images?.map((url) => <img key={url} src={proxiedCommentImage(url)} alt="评论图片" loading="lazy" referrerPolicy="no-referrer"/>)}{comment.likes ? <small>赞 {comment.likes}</small> : null}</article>) : <p className="comment-empty">本章暂未取得评论；联网后重新打开本章会再次尝试。</p>}</section>
+          </article> : <article className="paper" style={{ fontFamily: font, fontSize, lineHeight, width: paperWidth, maxWidth: "calc(100% - 30px)" }}><h1>{active.name}</h1><div className="rule"/><div dangerouslySetInnerHTML={{ __html: prepared.html }} /></article>}
+        </section>
+      </div>
+
+      <footer className="statusbar"><span>{active ? `阅读进度 ${progress}%` : `${books.length} 本书`}</span><span className="book-status" title={active?.name}>{active?.name || ""}</span><span className="chapter-status">{currentChapter || (active ? `${active.type.toUpperCase()} · ${formatSize(active.size)}` : "")}</span><span className="status-spacer"/><span>{active?.type === "pdf" ? "使用 PDF 工具栏跳页" : "0%"}</span><input aria-label="阅读进度" className="progress-slider" type="range" min="0" max="100" value={progress} disabled={!active || active.type === "pdf"} onChange={(e) => jumpProgress(Number(e.target.value))}/>{active?.type !== "pdf" && <label className="progress-entry"><input aria-label="输入阅读进度百分比" type="number" min="0" max="100" value={progress} disabled={!active} onChange={(e) => jumpProgress(Math.max(0, Math.min(100, Number(e.target.value))))}/><span>%</span></label>}</footer>
+      {dragging && <div className="drop-overlay"><div><span>⇩</span><b>松开即可加入书架</b><small>文件只会保存在本机浏览器</small></div></div>}
+      {loading && <div className="loading">正在整理书籍…</div>}
+      {toast && <div className="toast">✓ {toast}</div>}
+      {sourceOpen && <div className="source-overlay" role="dialog" aria-modal="true" aria-label="番茄书源">
+        <section className="source-dialog">
+          <header><div><span className="source-mark">F</span><div><b>番茄书源</b><small>先加入书架 · 章节按需读取 · 支持断点缓存</small></div></div><button aria-label="关闭" onClick={() => !sourceBusy && setSourceOpen(false)}>×</button></header>
+          <div className="source-search"><input ref={sourceInputRef} autoFocus onKeyDown={(e) => e.key === "Enter" && searchSource()} placeholder="输入书名或 15–20 位作品 ID"/><button disabled={sourceBusy} onClick={searchSource}>{sourceBusy && !sourceProgress ? "搜索中…" : "搜索"}</button></div>
+          <div className="source-status"><span className={sourceState.includes("未启动") || sourceState.includes("失败") || sourceState.includes("无法") ? "error" : ""}>{sourceState}</span>{sourceBusy && sourceProgress > 0 && <div className="source-progress"><i style={{ width: `${sourceProgress}%` }}/></div>}</div>
+          <div className="source-results">{sourceResults.map((book) => <article key={book.id}><div className="online-cover">{book.title.slice(0, 1)}</div><div><b>{book.title}</b><small>{book.author} · ID {book.id}</small><p>{book.description || "暂无简介"}</p></div><button disabled={sourceBusy} onClick={() => importOnlineBook(book)}>{sourceBusy ? "正在读取目录" : "加入书架"}</button></article>)}</div>
+          <footer>内容来自第三方上游，仅供个人本地阅读；请尊重版权与平台规则。</footer>
+        </section>
+      </div>}
+      {recommendOpen && <div className="recommend-overlay" role="dialog" aria-modal="true" aria-label="书籍推荐">
+        <section className="recommend-dialog">
+          <header><div><span className="recommend-mark">榜</span><div><b>书籍推荐</b><small>来自番茄小说排行榜 · 点击书籍查看简介</small></div></div><button aria-label="关闭书籍推荐" onClick={() => setRecommendOpen(false)}>×</button></header>
+          <nav className="rank-tabs">{rankTabs.map((tab) => <button key={tab.algo} className={rankAlgo === tab.algo ? "active" : ""} disabled={recommendBusy} onClick={() => loadRankBoard(rankId, tab.algo)}>{tab.name}</button>)}</nav>
+          <div className="recommend-body">
+            <div className="rank-list">{recommendBusy ? <p className="recommend-message">正在读取番茄排行榜…</p> : recommendError ? <p className="recommend-message error">{recommendError}</p> : recommendations.map((book) => <button key={book.id} className={selectedRecommendation?.id === book.id ? "selected" : ""} onClick={() => setSelectedRecommendation(book)}><span className={`rank-number rank-${book.rank}`}>{book.rank}</span>{book.cover ? <img src={proxiedCommentImage(book.cover)} alt=""/> : <span className="rank-cover">{book.title.slice(0, 1)}</span>}<span><b>{book.title}</b><small>{book.author}{book.category ? ` · ${book.category}` : ""}</small></span></button>)}</div>
+            <article className="book-intro">{selectedRecommendation ? <><div className="intro-head">{selectedRecommendation.cover ? <img src={proxiedCommentImage(selectedRecommendation.cover)} alt={`${selectedRecommendation.title}封面`}/> : <span className="intro-cover">{selectedRecommendation.title.slice(0, 1)}</span>}<div><p className="eyebrow">番茄榜单第 {selectedRecommendation.rank} 名</p><h2>{selectedRecommendation.title}</h2><p>{selectedRecommendation.author}{selectedRecommendation.category ? ` · ${selectedRecommendation.category}` : ""}</p>{selectedRecommendation.readCount && <small>{selectedRecommendation.readCount}</small>}</div></div><h3>内容简介</h3><p className="intro-text">{selectedRecommendation.description || "暂无简介"}</p><button className="recommend-add" disabled={sourceBusy || books.some((book) => book.sourceBookId === selectedRecommendation.id)} onClick={() => importOnlineBook(selectedRecommendation)}>{books.some((book) => book.sourceBookId === selectedRecommendation.id) ? "已在书架" : "加入书架"}</button></> : <p className="recommend-message">从左侧选择一本书查看简介</p>}</article>
+          </div>
+        </section>
+      </div>}
+    </main>
+  );
+}

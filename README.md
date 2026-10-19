@@ -26,23 +26,25 @@ http://localhost:3000/
 
 ### Windows 10/11
 
-#### 推荐：命令行一键安装并启动
+#### 推荐：下载预编译版
 
-项目完整解压后，在项目文件夹的地址栏输入 `cmd` 并回车，然后运行：
+打开仓库右侧的 [Releases](https://github.com/zouy3/docleaf-reader/releases)，下载 **DocLeaf-Windows-x64.zip** 并完整解压。该版本已经包含番茄书源 `.exe`，不需要安装 Rust，也不需要安装约 1.7 GB 的 Visual Studio C++ Build Tools。
+
+在解压后的项目文件夹地址栏输入 `cmd` 并回车，然后运行：
 
 ```bat
 一键启动-Windows.bat
 ```
 
-脚本会通过 Windows 自带的 `winget` 自动安装缺少的 Node.js、Rust 和 Visual Studio C++ Build Tools，随后安装项目依赖并启动 DocLeaf。也可以直接双击这个 `.bat` 文件，效果相同。
+脚本只会在缺少时通过 Windows 自带的 `winget` 安装 Node.js LTS，随后安装网页依赖并启动 DocLeaf。也可以直接双击这个 `.bat` 文件，效果相同。
 
-安装 C++ Build Tools 时 Windows 可能弹出管理员授权窗口，请选择“是”。首次安装和编译需要下载较多内容，耗时可能较长。如果提示找不到 `winget`，请先从 Microsoft Store 安装或更新 **应用安装程序（App Installer）**。
+如果提示找不到 `winget`，请先从 Microsoft Store 安装或更新 **应用安装程序（App Installer）**。
 
-下面是手动安装步骤，适合自动安装失败时排查。
+下面的 Rust 和 C++ 安装步骤仅供源码开发者使用；普通用户不需要安装。
 
-#### 第一步：下载完整项目
+#### 源码版说明
 
-在 GitHub 仓库页面点击 `Code` → `Download ZIP`，解压到普通文件夹。不要只单独下载 `一键启动-Windows.bat`，它还需要同目录下的源码和 `start-docleaf.ps1`。
+GitHub 页面中 `Code` → `Download ZIP` 得到的是源码版，不包含预编译 `.exe`。源码版仍需要以下完整开发环境。普通用户请下载 Releases 中的 Windows 包。
 
 #### 第二步：安装 Node.js
 
@@ -83,17 +85,17 @@ cargo -V
 
 进入解压后的项目文件夹，双击 `一键启动-Windows.bat`，或在该文件夹的命令提示符中运行它。脚本将：
 
-1. 自动安装缺少的 Node.js、Rust 和 C++ 编译工具；
+1. 检查预编译番茄书源和 Node.js；
 2. 首次运行时自动下载网页依赖；
 3. 打开番茄书源和网页服务两个命令窗口；
 4. 服务就绪后自动打开 `http://localhost:3000/`。
 
-首次安装依赖和编译 Rust 可能需要几分钟，请保持窗口开启。以后启动会快很多。关闭两个 DocLeaf 命令窗口即可停止服务。
+首次安装网页依赖可能需要几分钟，请保持窗口开启。以后启动会快很多。关闭两个 DocLeaf 命令窗口即可停止服务。
 
 #### Windows 常见问题
 
 - **`Node.js was not found`**：尚未安装 Node.js，或安装后的终端没有刷新。安装 Node.js 22+ 后关闭所有命令行窗口，必要时重启电脑。
-- **`Rust was not found`**：安装 Rust 后重新打开命令行，用 `cargo -V` 检查。
+- **仍提示需要 Rust**：下载的是源码 ZIP；请改为下载 Releases 中的 `DocLeaf-Windows-x64.zip`。
 - **找不到 `link.exe` / linker**：安装 Visual Studio Build Tools，并勾选“使用 C++ 的桌面开发”。
 - **端口被占用**：关闭旧的 DocLeaf、Node 或 Cargo 窗口后重新运行。
 - **浏览器没有自动打开**：手动访问 `http://localhost:3000/`。

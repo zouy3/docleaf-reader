@@ -1,0 +1,58 @@
+name: Build Windows package
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/windows-release.yml"
+      - "integrations/fqapp/rust/**"
+      - "integrations/fqapp/assets/**"
+      - "start-docleaf.ps1"
+      - "setup-and-start-docleaf.ps1"
+      - "一键启动-Windows.bat"
+
+permissions:
+  contents: write
+
+jobs:
+  windows-package:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: integrations/fqapp/rust
+
+      - name: Build precompiled source service
+        shell: pwsh
+        run: cargo build --release --manifest-path integrations/fqapp/rust/Cargo.toml --bin docleaf_bridge
+
+      - name: Assemble Windows package
+        shell: pwsh
+        run: |
+          git archive --format=zip --output docleaf-source.zip HEAD
+          New-Item -ItemType Directory -Force package | Out-Null
+          Expand-Archive docleaf-source.zip package
+          Copy-Item integrations/fqapp/rust/target/release/docleaf_bridge.exe package/integrations/fqapp/docleaf_bridge.exe
+          Compress-Archive -Path package/* -DestinationPath DocLeaf-Windows-x64.zip -CompressionLevel Optimal
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DocLeaf-Windows-x64
+          path: DocLeaf-Windows-x64.zip
+
+      - name: Publish latest Windows release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete windows-latest --cleanup-tag --yes
+          gh release create windows-latest DocLeaf-Windows-x64.zip --target "${{ github.sha }}" --title "DocLeaf Windows 最新版" --notes "Windows x64 预编译版。解压后运行 一键启动-Windows.bat。已包含番茄书源可执行文件，无需安装 Rust 或 Visual Studio C++ Build Tools。" --latest

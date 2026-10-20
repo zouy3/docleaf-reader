@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, MouseEvent, SyntheticEvent } from "react";
 import { marked } from "marked";
 
@@ -132,6 +132,25 @@ async function dbDelete(id: string) {
     const req = db.transaction(STORE, "readwrite").objectStore(STORE).delete(id);
     req.onsuccess = () => resolve();
     req.onerror = () => reject(req.error);
+  });
+}
+
+// Merge changes inside one transaction so background chapter caching cannot
+// overwrite a paragraph comment saved by a foreground request.
+async function dbUpdate(id: string, fallback: Book, update: (book: Book) => Book): Promise<Book> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(STORE, "readwrite");
+    const store = transaction.objectStore(STORE);
+    const request = store.get(id);
+    let result: Book;
+    request.onsuccess = () => {
+      result = update(request.result || fallback);
+      store.put(result);
+    };
+    transaction.oncomplete = () => resolve(result!);
+    transaction.onerror = () => reject(transaction.error);
+    transaction.onabort = () => reject(transaction.error);
   });
 }
 
@@ -307,8 +326,41 @@ function escapeText(value: string) {
   return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
+function normalizeRemoteContent(title: string, content: string) {
+  const doc = new DOMParser().parseFromString(content, "text/html");
+  // Some sources return newline-delimited plain text, others return indexed
+  // HTML paragraphs. Preserve source indexes whenever they are supplied.
+  doc.querySelectorAll("br").forEach((node) => node.replaceWith(doc.createTextNode("\n")));
+  if (!doc.body.querySelector("p,h1,h2,h3,h4,li,blockquote")) {
+    doc.body.innerHTML = textToHtml(doc.body.textContent || "");
+  } else {
+    [...doc.body.querySelectorAll("p")].forEach((paragraph) => {
+      if (paragraph.hasAttribute("idx") || paragraph.children.length) return;
+      const lines = (paragraph.textContent || "").split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+      if (lines.length < 2) return;
+      const fragment = doc.createDocumentFragment();
+      lines.forEach((line) => {
+        const block = doc.createElement("p");
+        block.textContent = line;
+        fragment.append(block);
+      });
+      paragraph.replaceWith(fragment);
+    });
+  }
+  const normalizedTitle = title.replace(/[\s　]+/g, "");
+  const firstBlock = doc.body.querySelector("p,h1,h2,h3,h4");
+  if (firstBlock?.textContent?.replace(/[\s　]+/g, "") === normalizedTitle) firstBlock.remove();
+  // Source text often already has full-width indentation. The reading setting
+  // supplies exactly two characters, rather than adding to existing spaces.
+  doc.body.querySelectorAll("p").forEach((paragraph) => {
+    const firstText = paragraph.firstChild;
+    if (firstText?.nodeType === 3) firstText.textContent = firstText.textContent?.replace(/^[\s　]+/, "") || "";
+  });
+  return safeHtml(doc.body.innerHTML);
+}
+
 function decorateRemoteContent(title: string, content: string, paragraphComments: Record<string, ReaderComment[]> = {}, paragraphCommentCounts: Record<string, number> = {}) {
-  const prepared = prepareContent(`<h2>${escapeText(title)}</h2>${content}`);
+  const prepared = prepareContent(`<h2>${escapeText(title)}</h2>${normalizeRemoteContent(title, content)}`);
   const doc = new DOMParser().parseFromString(prepared.html, "text/html");
   const zeroBased = Object.prototype.hasOwnProperty.call(paragraphCommentCounts, "0") || Object.prototype.hasOwnProperty.call(paragraphComments, "0");
   const paragraphs = [...doc.body.querySelectorAll("p")];
@@ -332,7 +384,10 @@ function decorateRemoteContent(title: string, content: string, paragraphComments
     panel.setAttribute("data-loaded", comments.length ? "true" : "false");
     panel.innerHTML = comments.map((comment) => `<article><b>${escapeText(comment.author)}</b>${comment.content ? `<p>${escapeText(comment.content)}</p>` : ""}${comment.images?.map((url) => `<img src="${escapeText(proxiedCommentImage(url))}" alt="评论图片" loading="lazy" referrerpolicy="no-referrer">`).join("") || ""}${comment.likes ? `<small>赞 ${comment.likes}</small>` : ""}</article>`).join("");
     paragraph.insertAdjacentElement("afterend", panel);
-    paragraph.insertAdjacentElement("afterend", button);
+    const anchor = doc.createElement("span");
+    anchor.className = "paragraph-comment-anchor";
+    anchor.append(button);
+    paragraph.append(anchor);
   });
   return doc.body.innerHTML;
 }
@@ -344,6 +399,13 @@ function flattenEpubToc(items: any[], level = 1): TocItem[] {
   ]);
 }
 
+// Paragraph discussions are expanded and populated in this DOM subtree.
+// Unrelated parent updates (cache counters, scroll progress, appearance) must
+// never re-apply its initial HTML and discard the live discussion panels.
+const ChapterBody = memo(function ChapterBody({ html }: { html: string }) {
+  return <div className="chapter-body" dangerouslySetInnerHTML={{ __html: html }} />;
+});
+
 export default function Home() {
   const [books, setBooks] = useState<Book[]>([]);
   const [active, setActive] = useState<Book | null>(null);
@@ -351,6 +413,10 @@ export default function Home() {
   const [lineHeight, setLineHeight] = useState(1.85);
   const [font, setFont] = useState("serif");
   const [paperWidth, setPaperWidth] = useState(790);
+  const [fitWidth, setFitWidth] = useState(false);
+  const [availablePaperWidth, setAvailablePaperWidth] = useState(3200);
+  const [firstIndent, setFirstIndent] = useState(true);
+  const [darkMode, setDarkMode] = useState(false);
   const [sideOpen, setSideOpen] = useState(true);
   const [zen, setZen] = useState(false);
   const [dragging, setDragging] = useState(false);
@@ -392,6 +458,22 @@ export default function Home() {
   const sourceInputRef = useRef<HTMLInputElement>(null);
   const cacheRunRef = useRef<string | null>(null);
   const remoteLoadRef = useRef(0);
+  const restoringRef = useRef(false);
+  const pendingRestoreRef = useRef<{ id: string; progress: number } | null>(null);
+  const commentRequestsRef = useRef(0);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const measure = () => {
+      const style = getComputedStyle(canvas);
+      setAvailablePaperWidth(Math.max(280, Math.floor(canvas.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight))));
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(canvas);
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
     dbAll().then((items) => {
@@ -408,6 +490,9 @@ export default function Home() {
       setLineHeight(p.lineHeight || 1.85);
       setFont(p.font || "serif");
       setPaperWidth(p.paperWidth || 790);
+      setFitWidth(Boolean(p.fitWidth));
+      setFirstIndent(p.firstIndent !== false);
+      setDarkMode(Boolean(p.darkMode));
     }
   }, []);
 
@@ -416,8 +501,8 @@ export default function Home() {
   }, [active]);
 
   useEffect(() => {
-    localStorage.setItem("docleaf-prefs", JSON.stringify({ fontSize, lineHeight, font, paperWidth }));
-  }, [fontSize, lineHeight, font, paperWidth]);
+    localStorage.setItem("docleaf-prefs", JSON.stringify({ fontSize, lineHeight, font, paperWidth, fitWidth, firstIndent, darkMode }));
+  }, [fontSize, lineHeight, font, paperWidth, fitWidth, firstIndent, darkMode]);
 
   useEffect(() => {
     if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
@@ -451,7 +536,7 @@ export default function Home() {
         epubBookRef.current = book;
         const rendition = book.renderTo(epubRef.current, { width: "100%", height: "100%", spread: "none" });
         renditionRef.current = rendition;
-        rendition.themes.default({ body: { padding: "28px 46px !important", color: "#292929", "font-family": font, "font-size": `${fontSize}px`, "line-height": String(lineHeight) } });
+        rendition.themes.default({ body: { padding: "28px 46px !important", color: darkMode ? "#d7dce5 !important" : "#292929 !important", background: darkMode ? "#252a33 !important" : "#ffffff !important", "font-family": font, "font-size": `${fontSize}px`, "line-height": String(lineHeight) } });
         Promise.all([book.loaded.navigation, book.ready.then(() => book.locations.generate(900))]).then(([navigation]) => {
           const items = flattenEpubToc(navigation.toc || []);
           tocRef.current = items;
@@ -469,11 +554,16 @@ export default function Home() {
         });
       });
     }
-  }, [active]);
+  }, [active?.id]);
 
   useEffect(() => {
-    renditionRef.current?.themes?.default({ body: { padding: "28px 46px !important", color: "#292929", "font-family": font, "font-size": `${fontSize}px`, "line-height": String(lineHeight) } });
-  }, [font, fontSize, lineHeight]);
+    renditionRef.current?.themes?.default({ body: {
+      color: darkMode ? "#d7dce5 !important" : "#292929 !important",
+      background: darkMode ? "#252a33 !important" : "#ffffff !important",
+      "font-family": font, "font-size": `${fontSize}px`, "line-height": String(lineHeight),
+      padding: "28px 46px !important",
+    } });
+  }, [darkMode, font, fontSize, lineHeight, active?.id]);
 
   const prepared = useMemo(() => active?.content ? prepareContent(active.content) : { html: "", toc: [] as TocItem[] }, [active]);
 
@@ -490,7 +580,33 @@ export default function Home() {
     if (!active || active.type === "epub" || active.type === "pdf") return;
     const anchorId = active.type === "fanqie" ? `${active.id}:${remoteChapterIndex}` : active.id;
     window.setTimeout(() => restoreScrollAnchor(anchorId, progress), 0);
-  }, [fontSize, lineHeight, paperWidth]);
+  }, [fontSize, lineHeight, paperWidth, fitWidth, firstIndent, font, sideOpen, zen]);
+
+  useEffect(() => {
+    if (remoteLoading || !remoteContent || !pendingRestoreRef.current) return;
+    const saved = pendingRestoreRef.current;
+    pendingRestoreRef.current = null;
+    const frame = requestAnimationFrame(() => restoreScrollAnchor(saved.id, saved.progress));
+    return () => cancelAnimationFrame(frame);
+  }, [remoteLoading, remoteContent]);
+
+  useEffect(() => {
+    const save = () => {
+      if (document.visibilityState === "hidden") trackScroll();
+    };
+    const resize = () => {
+      if (!active || remoteLoading || active.type === "pdf" || active.type === "epub") return;
+      restoreScrollAnchor(active.type === "fanqie" ? `${active.id}:${remoteChapterIndex}` : active.id, progress);
+    };
+    document.addEventListener("visibilitychange", save);
+    window.addEventListener("pagehide", trackScroll);
+    window.addEventListener("resize", resize);
+    return () => {
+      document.removeEventListener("visibilitychange", save);
+      window.removeEventListener("pagehide", trackScroll);
+      window.removeEventListener("resize", resize);
+    };
+  });
 
   useEffect(() => {
     if (sideOpen && sideTab === "toc" && currentChapter) {
@@ -499,6 +615,7 @@ export default function Home() {
   }, [sideOpen, sideTab, currentChapter]);
 
   function trackScroll() {
+    if (restoringRef.current || remoteLoading) return;
     if (!active || active.type === "epub" || active.type === "pdf") return;
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -510,8 +627,9 @@ export default function Home() {
     setProgress(pct);
     localStorage.setItem(`docleaf-progress:${active.id}`, String(pct));
     const blocks = [...canvas.querySelectorAll<HTMLElement>("[data-reader-block]")];
-    const anchor = blocks.filter((node) => node.getBoundingClientRect().top <= 240).at(-1) || blocks[0];
-    if (anchor) localStorage.setItem(`docleaf-anchor:${active.id}${active.type === "fanqie" ? `:${remoteChapterIndex}` : ""}`, JSON.stringify({ block: Number(anchor.dataset.readerBlock || 0), offset: 240 - anchor.getBoundingClientRect().top }));
+    const readingTop = canvas.getBoundingClientRect().top + 24;
+    const anchor = blocks.filter((node) => node.getBoundingClientRect().top <= readingTop).at(-1) || blocks[0];
+    if (anchor) localStorage.setItem(`docleaf-anchor:${active.id}${active.type === "fanqie" ? `:${remoteChapterIndex}` : ""}`, JSON.stringify({ block: Number(anchor.dataset.readerBlock || 0), offset: readingTop - anchor.getBoundingClientRect().top, relative: true }));
     const visible = prepared.toc.map((item) => document.getElementById(item.target)).filter(Boolean).reverse().find((node) => (node as HTMLElement).getBoundingClientRect().top < 240);
     if (visible) setCurrentChapter(visible.textContent?.trim() || "");
   }
@@ -519,11 +637,14 @@ export default function Home() {
   function restoreScrollAnchor(bookId: string, fallbackProgress: number) {
     const canvas = canvasRef.current;
     if (!canvas) return;
+    restoringRef.current = true;
+    requestAnimationFrame(() => { requestAnimationFrame(() => { restoringRef.current = false; }); });
     try {
       const anchor = JSON.parse(localStorage.getItem(`docleaf-anchor:${bookId}`) || "null");
       const block = canvas.querySelector<HTMLElement>(`[data-reader-block="${anchor?.block}"]`);
       if (block) {
-        canvas.scrollTop += block.getBoundingClientRect().top - 240 + Number(anchor.offset || 0);
+        const readingTop = anchor.relative ? canvas.getBoundingClientRect().top + 24 : 240;
+        canvas.scrollTop += block.getBoundingClientRect().top - readingTop + Number(anchor.offset || 0);
         return;
       }
     } catch {}
@@ -556,7 +677,7 @@ export default function Home() {
   async function toggleParagraphComments(event: MouseEvent<HTMLElement>) {
     const button = (event.target as HTMLElement).closest<HTMLButtonElement>(".paragraph-comment-toggle");
     if (!button) return;
-    const panel = button.nextElementSibling as HTMLElement | null;
+    const panel = button.closest("p")?.nextElementSibling as HTMLElement | null;
     const open = button.classList.toggle("open");
     panel?.classList.toggle("open", open);
     button.textContent = open ? "收起评论" : `评论 ${button.dataset.commentCount || 0}`;
@@ -566,6 +687,7 @@ export default function Home() {
     if (!chapter || paragraphIndex === undefined) return;
     button.disabled = true;
     button.textContent = "正在读取评论…";
+    commentRequestsRef.current++;
     try {
       const result = await fetchOneParagraphComments(active.sourceBookId, chapter, paragraphIndex);
       const comments = result.comments;
@@ -609,24 +731,25 @@ export default function Home() {
       }
       panel.dataset.loaded = "true";
       try {
-        const latest = await dbGet(active.id);
-        if (latest?.chapters?.[remoteChapterIndex]) {
+        await dbUpdate(active.id, active, (latest) => {
+          const index = latest.chapters?.findIndex((item) => item.id === chapter.id) ?? -1;
+          if (index < 0 || !latest.chapters) return latest;
           const chapters = [...latest.chapters];
-          chapters[remoteChapterIndex] = { ...chapters[remoteChapterIndex], version: result.version, paragraphComments: { ...(chapters[remoteChapterIndex].paragraphComments || {}), [paragraphIndex]: comments } };
-          await dbPut({ ...latest, chapters });
-        }
+          chapters[index] = { ...chapters[index], version: result.version, paragraphComments: { ...(chapters[index].paragraphComments || {}), [paragraphIndex]: comments } };
+          return { ...latest, chapters };
+        });
       } catch (cacheError) {
         // The online result is already visible. A quota/IndexedDB failure must not
         // turn a successfully loaded comment panel into an error state.
         console.warn("评论已显示，但本地缓存失败", cacheError);
       }
     } catch (error) {
-      panel.replaceChildren();
       const failure = document.createElement("p");
       failure.className = "comment-empty";
       failure.textContent = `${error instanceof Error ? error.message : "评论读取失败"}，收起后可再次点击重试。`;
       panel.append(failure);
     } finally {
+      commentRequestsRef.current--;
       button.disabled = false;
       button.textContent = "收起评论";
     }
@@ -827,7 +950,7 @@ export default function Home() {
     const latest = await dbGet(book.id) || book;
     const chapter = latest.chapters?.[index];
     if (!chapter) throw new Error("章节不存在");
-    if (chapter.content && chapter.commentsVersion === 2) return { book: latest, chapter };
+    if (chapter.content && (chapter.commentsVersion === 2 || !refreshShelf)) return { book: latest, chapter };
     let raw = chapter.content || "";
     if (!raw) {
       const response = await fetch(`${SOURCE_API}/api/content?source=${encodeURIComponent("番茄")}&book_id=${latest.sourceBookId}&item_id=${chapter.id}&tab=${encodeURIComponent("小说")}`);
@@ -836,26 +959,28 @@ export default function Home() {
       raw = Array.isArray(payload?.data?.content) ? payload.data.content.join("\n") : String(payload?.data?.content || "");
       if (!raw.trim()) throw new Error(`${chapter.title} 内容为空`);
     }
-    const commentData = await fetchChapterComments(latest.sourceBookId || "", chapter.id);
-    const current = await dbGet(book.id) || latest;
-    const storedChapter = { ...(current.chapters?.[index] || chapter), content: safeHtml(raw), comments: commentData.comments, paragraphComments: commentData.paragraphComments, paragraphCommentCounts: commentData.paragraphCommentCounts, commentsVersion: 2, cachedAt: Date.now() };
+    const commentData = refreshShelf ? await fetchChapterComments(latest.sourceBookId || "", chapter.id) : null;
+    const updated = await dbUpdate(book.id, latest, (current) => {
+    const existing = current.chapters?.[index] || chapter;
+    const storedChapter = { ...existing, content: normalizeRemoteContent(chapter.title, raw), ...(commentData ? { comments: commentData.comments, paragraphComments: { ...existing.paragraphComments, ...commentData.paragraphComments }, paragraphCommentCounts: commentData.paragraphCommentCounts, commentsVersion: 2 } : {}), cachedAt: Date.now() };
     const chapters = [...(current.chapters || [])];
     chapters[index] = storedChapter;
-    const updated: Book = {
+    return {
       ...current,
       chapters,
       size: chapters.reduce((sum, item) => sum + (item.content ? new Blob([item.content]).size : 0), 0),
       updatedAt: Date.now(),
     };
-    await dbPut(updated);
+    });
     if (refreshShelf) setBooks((old) => old.map((item) => item.id === updated.id ? updated : item));
-    return { book: updated, chapter: storedChapter };
+    return { book: updated, chapter: updated.chapters![index] };
   }
 
   async function loadRemoteChapter(book: Book, index: number) {
     if (!book.chapters?.length) return;
     const safeIndex = Math.max(0, Math.min(book.chapters.length - 1, index));
     const request = ++remoteLoadRef.current;
+    restoringRef.current = true;
     setRemoteLoading(true);
     setRemoteChapterIndex(safeIndex);
     try {
@@ -868,9 +993,10 @@ export default function Home() {
       setProgress(pct);
       localStorage.setItem(`docleaf-chapter:${book.id}`, String(safeIndex));
       localStorage.setItem(`docleaf-progress:${book.id}`, String(pct));
-      window.setTimeout(() => restoreScrollAnchor(`${book.id}:${safeIndex}`, 0), 0);
+      pendingRestoreRef.current = { id: `${book.id}:${safeIndex}`, progress: 0 };
     } catch (error) {
       if (request === remoteLoadRef.current) {
+        restoringRef.current = false;
         setRemoteContent(`<p class="reader-error">${error instanceof Error ? error.message : "章节加载失败"}，请确认书源服务已启动。</p>`);
         setRemoteComments([]);
       }
@@ -887,6 +1013,9 @@ export default function Home() {
       let latest = await dbGet(book.id) || book;
       const total = latest.chapters?.length || 0;
       for (let index = 0; index < total; index++) {
+        while (commentRequestsRef.current > 0) {
+          await new Promise((resolve) => window.setTimeout(resolve, 250));
+        }
         if (cacheRunRef.current !== book.id) break;
         if (latest.chapters?.[index]?.content) continue;
         setCacheState(`正在缓存 ${index + 1}/${total} 章`);
@@ -894,7 +1023,7 @@ export default function Home() {
         latest = result.book;
         if ((index + 1) % 10 === 0) setBooks((old) => old.map((item) => item.id === latest.id ? latest : item));
         setSourceProgress(Math.round(((index + 1) / total) * 100));
-        await new Promise((resolve) => window.setTimeout(resolve, 180));
+        await new Promise((resolve) => window.setTimeout(resolve, 800));
       }
       const cached = latest.chapters?.filter((chapter) => chapter.content).length || 0;
       setBooks((old) => old.map((item) => item.id === latest.id ? latest : item));
@@ -1005,7 +1134,7 @@ export default function Home() {
   const shownBooks = books.filter((book) => book.name.toLowerCase().includes(search.toLowerCase()));
 
   return (
-    <main className={`app ${zen ? "zen" : ""}`} onDragOver={(e) => { e.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={(e) => { e.preventDefault(); setDragging(false); importFiles(e.dataTransfer.files); }}>
+    <main className={`app ${zen ? "zen" : ""} ${darkMode ? "dark-mode" : ""}`} onDragOver={(e) => { e.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={(e) => { e.preventDefault(); setDragging(false); importFiles(e.dataTransfer.files); }}>
       <input ref={fileRef} className="sr-only" type="file" accept={ACCEPT} multiple onChange={(e) => e.target.files && importFiles(e.target.files)} />
       <header className="titlebar">
         <div className="brand"><span className="brand-mark">D</span><strong>DocLeaf</strong><span className="saved">本地模式 · 已自动保存</span></div>
@@ -1016,31 +1145,31 @@ export default function Home() {
       <nav className="tabs" aria-label="功能区选项卡">
         <button className="file-tab" onClick={() => fileRef.current?.click()}>文件</button>
         <button className="active">开始</button><button>插入</button><button>布局</button><button>视图</button><button className="recommend-tab" onClick={openRecommendations}>书籍推荐</button>
-        <span className="privacy">文件不会离开你的浏览器</span>
+        <button className="theme-toggle" aria-label={darkMode ? "切换浅色模式" : "切换深色模式"} aria-pressed={darkMode} onClick={() => setDarkMode(!darkMode)}>{darkMode ? "☀ 浅色" : "☾ 深色"}</button>
       </nav>
 
-      <section className="ribbon">
+      <section className="ribbon compact-ribbon" aria-label="阅读工具栏">
         <div className="tool-group import-group">
           <button className="big-tool" onClick={() => fileRef.current?.click()}><span className="tool-icon">＋</span><b>打开书籍</b></button>
-          <div className="mini-stack"><button onClick={() => { setSideOpen(true); setSideTab("library"); }}>☰ 书架</button><button onClick={openSource}>⌕ 番茄书源</button><button onClick={() => setActive(null)}>⌂ 主页</button></div>
+          <div className="mini-stack"><button onClick={() => { setSideOpen(!sideOpen); setSideTab("library"); }}>☰ 书架</button><button onClick={openSource}>⌕ 番茄</button></div>
           <label>书籍</label>
         </div>
-        <div className="tool-group">
+        <div className="tool-group font-tools">
           <div className="control-row">
             <select aria-label="字体" value={font} onChange={(e) => setFont(e.target.value)}><option value="serif">宋体</option><option value="sans-serif">黑体</option><option value="system-ui">系统字体</option></select>
-            <select aria-label="字号" value={fontSize} onChange={(e) => setFontSize(Number(e.target.value))}>{[14,16,18,20,22,24,28].map((n) => <option key={n}>{n}</option>)}</select>
+            <select aria-label="字号" value={fontSize} onChange={(e) => setFontSize(Number(e.target.value))}>{Array.from({ length: 21 }, (_, index) => index + 12).map((n) => <option key={n}>{n}</option>)}</select>
           </div>
-          <div className="format-buttons"><button onClick={() => setFontSize(Math.min(32, fontSize + 1))}>A↑</button><button onClick={() => setFontSize(Math.max(12, fontSize - 1))}>A↓</button><button className="bold">B</button><button className="italic">I</button><button className="underline">U</button><button>ab⌫</button></div>
+          <div className="format-buttons"><button aria-label="增大字号" onClick={() => setFontSize(Math.min(32, fontSize + 1))}>A＋</button><button aria-label="减小字号" onClick={() => setFontSize(Math.max(12, fontSize - 1))}>A－</button><span className="font-preview">字号 {fontSize}</span></div>
           <label>字体</label>
         </div>
         <div className="tool-group">
-          <div className="format-buttons wide"><button>☷</button><button>≡</button><button>☰</button><button>¶</button></div>
-          <div className="control-row"><span>行距</span><input aria-label="行距" type="range" min="1.3" max="2.5" step="0.05" value={lineHeight} onChange={(e) => setLineHeight(Number(e.target.value))} /></div>
+          <div className="control-row"><span>行距</span><select aria-label="行距" value={lineHeight} onChange={(e) => setLineHeight(Number(e.target.value))}>{[...new Set([1.3,1.5,1.65,1.75,1.85,2,2.25,2.5,lineHeight])].sort((a,b) => a-b).map(value => <option key={value} value={value}>{value} 倍</option>)}</select></div>
           <label>段落</label>
+          <button className="indent-toggle" aria-pressed={firstIndent} onClick={() => setFirstIndent(!firstIndent)}>首行缩进 2 字 {firstIndent ? "✓" : ""}</button>
         </div>
         <div className="tool-group paper-tools">
-          <div className="paper-width-value"><span>▯</span><b>{paperWidth}px</b></div>
-          <div className="control-row"><span>窄</span><input aria-label="纸张宽度" type="range" min="520" max="1200" step="10" value={paperWidth} onChange={(e) => setPaperWidth(Number(e.target.value))}/><span>宽</span></div>
+          <div className="paper-width-value"><b>{fitWidth ? "适应窗口" : `${Math.min(paperWidth, availablePaperWidth)}px`}</b><button aria-pressed={fitWidth} onClick={() => setFitWidth(!fitWidth)}>适应窗口</button></div>
+          <div className="control-row"><span>窄</span><input aria-label="纸张宽度" type="range" min={Math.min(360, availablePaperWidth)} max={availablePaperWidth} step="1" value={fitWidth ? availablePaperWidth : Math.min(paperWidth, availablePaperWidth)} onChange={(e) => { setFitWidth(false); setPaperWidth(Number(e.target.value)); }}/><span>宽</span></div>
           <label>纸张宽度</label>
         </div>
         <div className="tool-group view-tools">
@@ -1072,7 +1201,7 @@ export default function Home() {
           <div className="local-note"><span>⌾</span><p><b>完全离线</b><br/>所有书籍只存储在当前浏览器中</p></div>
         </aside>}
 
-        <section className="canvas" ref={canvasRef} onScroll={trackScroll} style={{ "--paper-width": `${paperWidth}px` } as CSSProperties}>
+        <section className={`canvas ${firstIndent ? "first-indent" : ""}`} ref={canvasRef} onScroll={trackScroll} style={{ "--paper-width": fitWidth ? "100%" : `${Math.min(paperWidth, availablePaperWidth)}px` } as CSSProperties}>
           {!active ? <div className="welcome-page">
             <div className="welcome-symbol">D</div>
             <p className="eyebrow">你的私人阅读空间</p>
@@ -1082,13 +1211,13 @@ export default function Home() {
             <div className="drop-tip"><span>⇩</span>也可以直接拖入文件</div>
             <div className="formats"><span>EPUB</span><span>PDF</span><span>TXT</span><span>DOCX</span><span>MD</span><span>HTML</span><span>FB2</span><span>RTF</span></div>
             <div className="feature-row"><div><b>私密</b><small>内容不经服务器</small></div><div><b>离线</b><small>断网也能阅读</small></div><div><b>专注</b><small>熟悉的文档外观</small></div></div>
-          </div> : active.type === "pdf" && pdfUrl ? <div className="special-reader" style={{ width: paperWidth, maxWidth: "100%" }}><iframe title={active.name} src={pdfUrl} /></div> : active.type === "epub" ? <div className="special-reader epub-shell" style={{ width: paperWidth, maxWidth: "100%" }}><div className="epub-view" ref={epubRef}/><div className="epub-controls"><button onClick={() => renditionRef.current?.prev()}>← 上一页</button><span>{progress}%</span><button onClick={() => renditionRef.current?.next()}>下一页 →</button></div></div> : active.type === "fanqie" && active.chapters?.length ? <article className="paper remote-paper" onClick={toggleParagraphComments} onError={handleCommentImageError} style={{ fontFamily: font, fontSize, lineHeight, width: paperWidth, maxWidth: "calc(100% - 30px)" }}>
+          </div> : active.type === "pdf" && pdfUrl ? <div className="special-reader" style={{ width: fitWidth ? "100%" : Math.min(paperWidth, availablePaperWidth), maxWidth: "100%" }}><iframe title={active.name} src={pdfUrl} /></div> : active.type === "epub" ? <div className="special-reader epub-shell" style={{ width: fitWidth ? "100%" : Math.min(paperWidth, availablePaperWidth), maxWidth: "100%" }}><div className="epub-view" ref={epubRef}/><div className="epub-controls"><button onClick={() => renditionRef.current?.prev()}>← 上一页</button><span>{progress}%</span><button onClick={() => renditionRef.current?.next()}>下一页 →</button></div></div> : active.type === "fanqie" && active.chapters?.length ? <article className="paper remote-paper" onClick={toggleParagraphComments} onError={handleCommentImageError} style={{ fontFamily: font, fontSize, lineHeight, width: fitWidth ? "100%" : Math.min(paperWidth, availablePaperWidth), maxWidth: "100%" }}>
             <div className="remote-toolbar"><span>{active.author || "未知作者"} · {remoteChapterIndex + 1}/{active.chapters?.length || 0}</span><button disabled={cacheRunning} onClick={() => cacheOnlineBook(active)}>{cacheRunning ? cacheState || "正在缓存…" : (cacheState.includes("全部") ? cacheState : "缓存全书 / 继续缓存")}</button></div>
             <div className="rule"/>
-            {remoteLoading ? <div className="chapter-loading">正在在线读取本章…</div> : <div dangerouslySetInnerHTML={{ __html: remoteContent }} />}
+            {remoteLoading ? <div className="chapter-loading">正在在线读取本章…</div> : <ChapterBody key={`${active.id}:${remoteChapterIndex}`} html={remoteContent} />}
             <nav className="chapter-nav"><button disabled={remoteChapterIndex <= 0 || remoteLoading} onClick={() => loadRemoteChapter(active, remoteChapterIndex - 1)}>← 上一章</button><button onClick={() => { setSideOpen(true); setSideTab("toc"); }}>目录</button><button disabled={remoteChapterIndex >= (active.chapters?.length || 1) - 1 || remoteLoading} onClick={() => loadRemoteChapter(active, remoteChapterIndex + 1)}>下一章 →</button></nav>
             <section className="reader-comments"><h3>读者评论 <span>{remoteComments.length}</span></h3>{remoteComments.length ? remoteComments.map((comment) => <article key={comment.id}><b>{comment.author}</b>{comment.content && <p>{comment.content}</p>}{comment.images?.map((url) => <img key={url} src={proxiedCommentImage(url)} alt="评论图片" loading="lazy" referrerPolicy="no-referrer"/>)}{comment.likes ? <small>赞 {comment.likes}</small> : null}</article>) : <p className="comment-empty">本章暂未取得评论；联网后重新打开本章会再次尝试。</p>}</section>
-          </article> : <article className="paper" style={{ fontFamily: font, fontSize, lineHeight, width: paperWidth, maxWidth: "calc(100% - 30px)" }}><h1>{active.name}</h1><div className="rule"/><div dangerouslySetInnerHTML={{ __html: prepared.html }} /></article>}
+          </article> : <article className="paper" style={{ fontFamily: font, fontSize, lineHeight, width: fitWidth ? "100%" : Math.min(paperWidth, availablePaperWidth), maxWidth: "100%" }}><h1>{active.name}</h1><div className="rule"/><div dangerouslySetInnerHTML={{ __html: prepared.html }} /></article>}
         </section>
       </div>
 

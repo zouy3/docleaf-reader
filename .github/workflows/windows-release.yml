@@ -5,6 +5,10 @@ on:
   push:
     branches: [main]
     paths:
+      - "app/**"
+      - "public/**"
+      - "package.json"
+      - "package-lock.json"
       - ".github/workflows/windows-release.yml"
       - "integrations/fqapp/rust/**"
       - "integrations/fqapp/assets/**"

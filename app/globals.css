@@ -120,7 +120,22 @@
   line-height:1.4; font-size:clamp(10px,.65em,12px);
 }
 .canvas .remote-paper { padding-right:clamp(96px,5vw,120px)!important; }
-.paper .paragraph-comment-toggle.open { font-size:10px; }
+.paper .paragraph-comment-toggle,
+.paper .paragraph-comment-toggle.open {
+  font-family:inherit; font-size:1em; line-height:inherit;
+}
+.paper .reader-comments,.paper .paragraph-comment-panel {
+  font-family:inherit; font-size:1em; line-height:inherit;
+}
+.paper .reader-comments > article b,.paper .paragraph-comment-panel b {
+  font-size:.9em;
+}
+.paper .reader-comments > article small,.paper .paragraph-comment-panel small,
+.paper .comment-empty,.paper .comment-image-error {
+  font-size:.85em;
+}
+.paper .reader-comments h3 { font-family:inherit; font-size:1.05em; }
+.paper .reader-comments h3 span { font-family:inherit; font-size:.85em; }
 .paper .paragraph-comment-panel { margin:.3em 0 1em; text-indent:0; }
 .paper p[data-reader-block] { margin-bottom:.65em; }
 .paper-width-value button,.indent-toggle { border:1px solid #c5ccd5; background:#fff; border-radius:3px; padding:3px 6px; font-size:11px; cursor:pointer; }

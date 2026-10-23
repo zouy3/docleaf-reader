@@ -93,6 +93,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release delete desktop-latest --repo "${{ github.repository }}" --cleanup-tag --yes || true
-          gh release create desktop-latest release-assets/*.zip --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "DocLeaf 桌面预编译版" --notes "包含 Windows x64、macOS Apple Silicon 和 macOS Intel 三个预编译包。解压后运行对应的一键启动文件，无需安装 Rust 或 C++ Build Tools。" --latest
+          set -euo pipefail
+          repo="${{ github.repository }}"
+          sha="${{ github.sha }}"
+          notes="连续阅读：章末继续下滑自动加载下一章，支持失败重试和位置恢复。评论文字比正文小 2px。包含 Windows x64、macOS Apple Silicon 和 macOS Intel 预编译包，无需安装 Rust 或 C++ Build Tools。"
+          if gh release view desktop-latest --repo "$repo" >/dev/null 2>&1; then
+            gh release upload desktop-latest release-assets/*.zip --repo "$repo" --clobber
+            gh api --method PATCH "repos/$repo/git/refs/tags/desktop-latest" -f sha="$sha" -F force=true
+            gh release edit desktop-latest --repo "$repo" --target "$sha" --title "DocLeaf 桌面预编译版" --notes "$notes" --latest
+          else
+            gh release create desktop-latest release-assets/*.zip --repo "$repo" --target "$sha" --title "DocLeaf 桌面预编译版" --notes "$notes" --latest
+          fi
 

@@ -1,5 +1,14 @@
 @import "tailwindcss";
 
+.reading-chapter + .reading-chapter { border-top:1px solid var(--line); margin-top:3em; padding-top:1em; }
+.continuous-tail { min-height:96px; display:grid; place-items:center; padding:28px 0 12px; text-align:center; font:13px/1.6 Arial,sans-serif; color:var(--muted); }
+.continuous-tail button { padding:8px 16px; border:1px solid var(--line); border-radius:4px; background:transparent; cursor:pointer; color:inherit; }
+.continuous-reading > .chapter-nav { display:none; }
+.chapter-discussion { margin:1.5em 0; font-size:.9em; }
+.chapter-discussion summary { cursor:pointer; color:var(--muted); }
+.chapter-discussion .reader-comments { margin-top:12px; }
+.app .compact-ribbon .view-tools { width:190px; }
+
 /* A single compact ribbon keeps the reading viewport tall at every zoom level. */
 .app .compact-ribbon {
   height:88px!important; min-height:88px; max-height:88px;
@@ -31,7 +40,7 @@
 .app .compact-ribbon .paper-tools { width:180px; }
 .app .compact-ribbon .paper-width-value { justify-content:space-between; gap:4px; }
 .app .compact-ribbon .paper-tools input { width:100%; min-width:0; }
-.app .compact-ribbon .view-tools { width:122px; flex-wrap:nowrap; }
+.app .compact-ribbon .view-tools { width:190px; flex-wrap:nowrap; }
 .app .compact-ribbon .view-tools button { padding:3px 5px; font-size:10px; white-space:nowrap; }
 .app .compact-ribbon .view-tools button span { font-size:20px; }
 .app .compact-ribbon .chapter-tools { width:128px; flex-wrap:nowrap; border-right:0; }
@@ -122,10 +131,11 @@
 .canvas .remote-paper { padding-right:clamp(96px,5vw,120px)!important; }
 .paper .paragraph-comment-toggle,
 .paper .paragraph-comment-toggle.open {
-  font-family:inherit; font-size:1em; line-height:inherit;
+  font-family:inherit; font-size:max(12px,calc(1em - 2px)); line-height:inherit;
 }
+.paper .chapter-discussion { font-size:inherit; }
 .paper .reader-comments,.paper .paragraph-comment-panel {
-  font-family:inherit; font-size:1em; line-height:inherit;
+  font-family:inherit; font-size:max(12px,calc(1em - 2px)); line-height:inherit;
 }
 .paper .reader-comments > article b,.paper .paragraph-comment-panel b {
   font-size:.9em;

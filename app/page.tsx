@@ -359,7 +359,7 @@ function normalizeRemoteContent(title: string, content: string) {
   return safeHtml(doc.body.innerHTML);
 }
 
-function decorateRemoteContent(title: string, content: string, paragraphComments: Record<string, ReaderComment[]> = {}, paragraphCommentCounts: Record<string, number> = {}) {
+function decorateRemoteContent(title: string, content: string, paragraphComments: Record<string, ReaderComment[]> = {}, paragraphCommentCounts: Record<string, number> = {}, chapterComments: ReaderComment[] = []) {
   const prepared = prepareContent(`<h2>${escapeText(title)}</h2>${normalizeRemoteContent(title, content)}`);
   const doc = new DOMParser().parseFromString(prepared.html, "text/html");
   const zeroBased = Object.prototype.hasOwnProperty.call(paragraphCommentCounts, "0") || Object.prototype.hasOwnProperty.call(paragraphComments, "0");
@@ -389,7 +389,7 @@ function decorateRemoteContent(title: string, content: string, paragraphComments
     anchor.append(button);
     paragraph.append(anchor);
   });
-  return doc.body.innerHTML;
+  return doc.body.innerHTML + (chapterComments.length ? `<details class="chapter-discussion"><summary>本章评论 · ${chapterComments.length}</summary><section class="reader-comments">${chapterComments.map(comment => `<article><b>${escapeText(comment.author)}</b><p>${escapeText(comment.content)}</p>${comment.images?.map(url => `<img src="${escapeText(proxiedCommentImage(url))}" alt="评论图片" loading="lazy" referrerpolicy="no-referrer">`).join("") || ""}${comment.likes ? `<small>赞 ${comment.likes}</small>` : ""}</article>`).join("")}</section></details>` : "");
 }
 
 function flattenEpubToc(items: any[], level = 1): TocItem[] {
@@ -435,6 +435,12 @@ export default function Home() {
   const [sourceProgress, setSourceProgress] = useState(0);
   const [remoteChapterIndex, setRemoteChapterIndex] = useState(0);
   const [remoteContent, setRemoteContent] = useState("");
+  const [continuous, setContinuous] = useState(true);
+  const [readingChapters, setReadingChapters] = useState<{index:number; html:string}[]>([]);
+  const [appendLoading, setAppendLoading] = useState(false);
+  const [appendError, setAppendError] = useState("");
+  const appendingRef = useRef(false);
+  const prefetchRef = useRef<{key:string; promise:Promise<unknown>} | null>(null);
   const [remoteComments, setRemoteComments] = useState<ReaderComment[]>([]);
   const [remoteLoading, setRemoteLoading] = useState(false);
   const [cacheRunning, setCacheRunning] = useState(false);
@@ -493,6 +499,7 @@ export default function Home() {
       setFitWidth(Boolean(p.fitWidth));
       setFirstIndent(p.firstIndent !== false);
       setDarkMode(Boolean(p.darkMode));
+      setContinuous(p.continuous !== false);
     }
   }, []);
 
@@ -501,8 +508,8 @@ export default function Home() {
   }, [active]);
 
   useEffect(() => {
-    localStorage.setItem("docleaf-prefs", JSON.stringify({ fontSize, lineHeight, font, paperWidth, fitWidth, firstIndent, darkMode }));
-  }, [fontSize, lineHeight, font, paperWidth, fitWidth, firstIndent, darkMode]);
+    localStorage.setItem("docleaf-prefs", JSON.stringify({ fontSize, lineHeight, font, paperWidth, fitWidth, firstIndent, darkMode, continuous }));
+  }, [fontSize, lineHeight, font, paperWidth, fitWidth, firstIndent, darkMode, continuous]);
 
   useEffect(() => {
     if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
@@ -620,19 +627,48 @@ export default function Home() {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const max = canvas.scrollHeight - canvas.clientHeight;
-    const within = max > 0 ? canvas.scrollTop / max : 0;
+    const readingTop = canvas.getBoundingClientRect().top + 24;
+    const sections = [...canvas.querySelectorAll<HTMLElement>("[data-reading-chapter]")];
+    const section = sections.filter(node => node.getBoundingClientRect().top <= readingTop).at(-1) || sections[0];
+    const index = section ? Number(section.dataset.readingChapter) : remoteChapterIndex;
+    const within = section ? Math.max(0, Math.min(1, (readingTop - section.getBoundingClientRect().top) / Math.max(1,section.offsetHeight))) : (max > 0 ? canvas.scrollTop / max : 0);
+    if (active.type === "fanqie") {
+      setRemoteChapterIndex(index);
+      setCurrentChapter(active.chapters?.[index]?.title || "");
+      localStorage.setItem(`docleaf-chapter:${active.id}`, String(index));
+      if (continuous && max - canvas.scrollTop < 160 && !appendError) void appendNextChapter();
+      else if (continuous && max - canvas.scrollTop < canvas.clientHeight) prefetchNextChapter();
+    }
     const pct = active.type === "fanqie" && active.chapters?.length
-      ? Math.round(((remoteChapterIndex + within) / active.chapters.length) * 100)
+      ? Math.round(((index + within) / active.chapters.length) * 100)
       : Math.round(within * 100);
     setProgress(pct);
     localStorage.setItem(`docleaf-progress:${active.id}`, String(pct));
-    const blocks = [...canvas.querySelectorAll<HTMLElement>("[data-reader-block]")];
-    const readingTop = canvas.getBoundingClientRect().top + 24;
+    const blocks = [...(section || canvas).querySelectorAll<HTMLElement>("[data-reader-block]")];
     const anchor = blocks.filter((node) => node.getBoundingClientRect().top <= readingTop).at(-1) || blocks[0];
-    if (anchor) localStorage.setItem(`docleaf-anchor:${active.id}${active.type === "fanqie" ? `:${remoteChapterIndex}` : ""}`, JSON.stringify({ block: Number(anchor.dataset.readerBlock || 0), offset: readingTop - anchor.getBoundingClientRect().top, relative: true }));
+    if (anchor) localStorage.setItem(`docleaf-anchor:${active.id}${active.type === "fanqie" ? `:${index}` : ""}`, JSON.stringify({ block: Number(anchor.dataset.readerBlock || 0), offset: readingTop - anchor.getBoundingClientRect().top, relative: true }));
     const visible = prepared.toc.map((item) => document.getElementById(item.target)).filter(Boolean).reverse().find((node) => (node as HTMLElement).getBoundingClientRect().top < 240);
     if (visible) setCurrentChapter(visible.textContent?.trim() || "");
   }
+
+  useEffect(() => {
+    const keydown = (event: KeyboardEvent) => {
+      if (!active || active.type !== "fanqie" || !continuous || sourceOpen || recommendOpen || event.ctrlKey || event.metaKey || event.altKey) return;
+      const target = event.target as HTMLElement;
+      if (target.closest("input,textarea,select,[contenteditable=true],.paragraph-comment-panel")) return;
+      if (event.key === " " && target.closest("button,summary")) return;
+      const down = event.key === "PageDown" || event.key === "ArrowDown" || (event.key === " " && !event.shiftKey);
+      const up = event.key === "PageUp" || event.key === "ArrowUp" || (event.key === " " && event.shiftKey);
+      const canvas = canvasRef.current;
+      if ((!down && !up) || !canvas) return;
+      event.preventDefault();
+      if (down && canvas.scrollHeight - canvas.clientHeight - canvas.scrollTop < 160) {
+        if (!appendError) void appendNextChapter();
+      } else canvas.scrollBy({ top: (down ? 1 : -1) * (event.key.startsWith("Arrow") ? 60 : canvas.clientHeight * .85), behavior:"smooth" });
+    };
+    window.addEventListener("keydown",keydown);
+    return () => window.removeEventListener("keydown",keydown);
+  });
 
   function restoreScrollAnchor(bookId: string, fallbackProgress: number) {
     const canvas = canvasRef.current;
@@ -641,7 +677,9 @@ export default function Home() {
     requestAnimationFrame(() => { requestAnimationFrame(() => { restoringRef.current = false; }); });
     try {
       const anchor = JSON.parse(localStorage.getItem(`docleaf-anchor:${bookId}`) || "null");
-      const block = canvas.querySelector<HTMLElement>(`[data-reader-block="${anchor?.block}"]`);
+      const index = bookId.split(":").at(-1);
+      const section = canvas.querySelector<HTMLElement>(`[data-reading-chapter="${index}"]`) || canvas;
+      const block = section.querySelector<HTMLElement>(`[data-reader-block="${anchor?.block}"]`);
       if (block) {
         const readingTop = anchor.relative ? canvas.getBoundingClientRect().top + 24 : 240;
         canvas.scrollTop += block.getBoundingClientRect().top - readingTop + Number(anchor.offset || 0);
@@ -682,7 +720,8 @@ export default function Home() {
     panel?.classList.toggle("open", open);
     button.textContent = open ? "收起评论" : `评论 ${button.dataset.commentCount || 0}`;
     if (!open || !panel || panel.dataset.loaded === "true" || !active?.sourceBookId) return;
-    const chapter = active.chapters?.[remoteChapterIndex];
+    const chapterIndex = Number(button.closest<HTMLElement>("[data-reading-chapter]")?.dataset.readingChapter ?? remoteChapterIndex);
+    const chapter = active.chapters?.[chapterIndex];
     const paragraphIndex = button.dataset.paragraphComments;
     if (!chapter || paragraphIndex === undefined) return;
     button.disabled = true;
@@ -980,13 +1019,16 @@ export default function Home() {
     if (!book.chapters?.length) return;
     const safeIndex = Math.max(0, Math.min(book.chapters.length - 1, index));
     const request = ++remoteLoadRef.current;
+    prefetchRef.current = null;
     restoringRef.current = true;
     setRemoteLoading(true);
+    setAppendError("");
     setRemoteChapterIndex(safeIndex);
     try {
       const result = await fetchAndStoreChapter(book, safeIndex);
       if (request !== remoteLoadRef.current) return;
       setRemoteContent(decorateRemoteContent(result.chapter.title, result.chapter.content || "", result.chapter.paragraphComments, result.chapter.paragraphCommentCounts));
+      setReadingChapters([{ index: safeIndex, html: decorateRemoteContent(result.chapter.title, result.chapter.content || "", result.chapter.paragraphComments, result.chapter.paragraphCommentCounts, result.chapter.comments) }]);
       setRemoteComments(result.chapter.comments?.length ? result.chapter.comments : (result.book.comments || []));
       setCurrentChapter(result.chapter.title);
       const pct = Math.round(((safeIndex + 1) / (result.book.chapters?.length || 1)) * 100);
@@ -1002,6 +1044,37 @@ export default function Home() {
       }
     } finally {
       if (request === remoteLoadRef.current) setRemoteLoading(false);
+    }
+  }
+
+  function prefetchNextChapter() {
+    if (!active || remoteLoading || appendingRef.current || commentRequestsRef.current > 0 || cacheRunRef.current) return;
+    const index = (readingChapters.at(-1)?.index ?? -1) + 1;
+    if (index <= 0 || index >= (active.chapters?.length || 0)) return;
+    const key = `${active.id}:${index}`;
+    if (prefetchRef.current?.key === key) return;
+    prefetchRef.current = { key, promise: fetchAndStoreChapter(active,index,false).catch(() => undefined) };
+  }
+
+  async function appendNextChapter() {
+    if (!continuous || !active?.chapters || remoteLoading || restoringRef.current || appendingRef.current || commentRequestsRef.current > 0) return;
+    const last = readingChapters.at(-1);
+    if (!last || last.index >= active.chapters.length - 1) return;
+    const generation = remoteLoadRef.current;
+    appendingRef.current = true;
+    setAppendLoading(true);
+    setAppendError("");
+    try {
+      if (prefetchRef.current?.key === `${active.id}:${last.index + 1}`) await prefetchRef.current.promise;
+      const result = await fetchAndStoreChapter(active, last.index + 1);
+      if (generation !== remoteLoadRef.current) return;
+      const html = decorateRemoteContent(result.chapter.title, result.chapter.content || "", result.chapter.paragraphComments, result.chapter.paragraphCommentCounts, result.chapter.comments);
+      setReadingChapters(old => old.some(item => item.index === last.index + 1) ? old : [...old, {index:last.index + 1, html}]);
+    } catch {
+      if (generation === remoteLoadRef.current) setAppendError("下一章加载失败，点击重试");
+    } finally {
+      appendingRef.current = false;
+      setAppendLoading(false);
     }
   }
 
@@ -1173,6 +1246,7 @@ export default function Home() {
           <label>纸张宽度</label>
         </div>
         <div className="tool-group view-tools">
+          <button aria-pressed={continuous} title="章末继续下滑，自动接上下一章" onClick={() => { setContinuous(!continuous); if (active?.type === "fanqie") void loadRemoteChapter(active, remoteChapterIndex); }}><span>⇣</span>{continuous ? "连续阅读 ✓" : "连续阅读"}</button>
           <button onClick={() => { setSideOpen(true); setSideTab("toc"); }}><span>▤</span>目录</button>
           <button onClick={() => setZen(!zen)}><span>◱</span>专注阅读</button>
           <label>视图</label>
@@ -1211,12 +1285,14 @@ export default function Home() {
             <div className="drop-tip"><span>⇩</span>也可以直接拖入文件</div>
             <div className="formats"><span>EPUB</span><span>PDF</span><span>TXT</span><span>DOCX</span><span>MD</span><span>HTML</span><span>FB2</span><span>RTF</span></div>
             <div className="feature-row"><div><b>私密</b><small>内容不经服务器</small></div><div><b>离线</b><small>断网也能阅读</small></div><div><b>专注</b><small>熟悉的文档外观</small></div></div>
-          </div> : active.type === "pdf" && pdfUrl ? <div className="special-reader" style={{ width: fitWidth ? "100%" : Math.min(paperWidth, availablePaperWidth), maxWidth: "100%" }}><iframe title={active.name} src={pdfUrl} /></div> : active.type === "epub" ? <div className="special-reader epub-shell" style={{ width: fitWidth ? "100%" : Math.min(paperWidth, availablePaperWidth), maxWidth: "100%" }}><div className="epub-view" ref={epubRef}/><div className="epub-controls"><button onClick={() => renditionRef.current?.prev()}>← 上一页</button><span>{progress}%</span><button onClick={() => renditionRef.current?.next()}>下一页 →</button></div></div> : active.type === "fanqie" && active.chapters?.length ? <article className="paper remote-paper" onClick={toggleParagraphComments} onError={handleCommentImageError} style={{ fontFamily: font, fontSize, lineHeight, width: fitWidth ? "100%" : Math.min(paperWidth, availablePaperWidth), maxWidth: "100%" }}>
+          </div> : active.type === "pdf" && pdfUrl ? <div className="special-reader" style={{ width: fitWidth ? "100%" : Math.min(paperWidth, availablePaperWidth), maxWidth: "100%" }}><iframe title={active.name} src={pdfUrl} /></div> : active.type === "epub" ? <div className="special-reader epub-shell" style={{ width: fitWidth ? "100%" : Math.min(paperWidth, availablePaperWidth), maxWidth: "100%" }}><div className="epub-view" ref={epubRef}/><div className="epub-controls"><button onClick={() => renditionRef.current?.prev()}>← 上一页</button><span>{progress}%</span><button onClick={() => renditionRef.current?.next()}>下一页 →</button></div></div> : active.type === "fanqie" && active.chapters?.length ? <article className={`paper remote-paper ${continuous ? "continuous-reading" : ""}`} onClick={toggleParagraphComments} onError={handleCommentImageError} style={{ fontFamily: font, fontSize, lineHeight, width: fitWidth ? "100%" : Math.min(paperWidth, availablePaperWidth), maxWidth: "100%" }}>
             <div className="remote-toolbar"><span>{active.author || "未知作者"} · {remoteChapterIndex + 1}/{active.chapters?.length || 0}</span><button disabled={cacheRunning} onClick={() => cacheOnlineBook(active)}>{cacheRunning ? cacheState || "正在缓存…" : (cacheState.includes("全部") ? cacheState : "缓存全书 / 继续缓存")}</button></div>
             <div className="rule"/>
-            {remoteLoading ? <div className="chapter-loading">正在在线读取本章…</div> : <ChapterBody key={`${active.id}:${remoteChapterIndex}`} html={remoteContent} />}
+            {remoteLoading ? <div className="chapter-loading">正在在线读取本章…</div> : readingChapters.length ? readingChapters.map(item => <section className="reading-chapter" data-reading-chapter={item.index} key={`${active.id}:${item.index}`}><ChapterBody html={item.html} /></section>) : <ChapterBody html={remoteContent} />}
+            {continuous && !remoteLoading && <div className="continuous-tail">
+              {appendLoading ? <span role="status">正在加载下一章…</span> : appendError ? <button onClick={() => void appendNextChapter()}>{appendError}</button> : (readingChapters.at(-1)?.index ?? 0) >= active.chapters.length - 1 ? <span>已读至本书最后一章</span> : <button onClick={() => void appendNextChapter()}>继续下滑，阅读下一章 ↓</button>}
+            </div>}
             <nav className="chapter-nav"><button disabled={remoteChapterIndex <= 0 || remoteLoading} onClick={() => loadRemoteChapter(active, remoteChapterIndex - 1)}>← 上一章</button><button onClick={() => { setSideOpen(true); setSideTab("toc"); }}>目录</button><button disabled={remoteChapterIndex >= (active.chapters?.length || 1) - 1 || remoteLoading} onClick={() => loadRemoteChapter(active, remoteChapterIndex + 1)}>下一章 →</button></nav>
-            <section className="reader-comments"><h3>读者评论 <span>{remoteComments.length}</span></h3>{remoteComments.length ? remoteComments.map((comment) => <article key={comment.id}><b>{comment.author}</b>{comment.content && <p>{comment.content}</p>}{comment.images?.map((url) => <img key={url} src={proxiedCommentImage(url)} alt="评论图片" loading="lazy" referrerPolicy="no-referrer"/>)}{comment.likes ? <small>赞 {comment.likes}</small> : null}</article>) : <p className="comment-empty">本章暂未取得评论；联网后重新打开本章会再次尝试。</p>}</section>
           </article> : <article className="paper" style={{ fontFamily: font, fontSize, lineHeight, width: fitWidth ? "100%" : Math.min(paperWidth, availablePaperWidth), maxWidth: "100%" }}><h1>{active.name}</h1><div className="rule"/><div dangerouslySetInnerHTML={{ __html: prepared.html }} /></article>}
         </section>
       </div>
